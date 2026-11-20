@@ -435,45 +435,7 @@ app.post(
 
 app.get("/vendor/services", verifyInternalRequest, async (req, res) => {
   try {
-    const vendorEmail = req.headers["x-user-email"];
-
-    if (!vendorEmail) {
-      return res.status(401).json({
-        success: false,
-        message: "Vendor email is required",
-      });
-    }
-
-    const services = await servicesCollection
-      .find({ vendorEmail: vendorEmail })
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    return res.status(200).json({
-      success: true,
-      totalServices: services.length,
-      services,
-    });
-  } catch (error) {
-    console.error("Fetch Vendor Services Error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to fetch vendor services",
-    });
-  }
-});
-
-// ? ======== GET method end ==========
-
-// *** ======================================
-// todo GET method for vendor Booking Requests
-// ***=======================================
-
-app.get("/vendor/bookings", verifyInternalRequest, async (req, res) => {
-  try {
     const vendorId = req.headers["x-user-id"];
-    const status = req.query.status;
 
     if (!vendorId) {
       return res.status(401).json({
@@ -482,42 +444,56 @@ app.get("/vendor/bookings", verifyInternalRequest, async (req, res) => {
       });
     }
 
-    // Build MongoDB query
+    // Find only this vendor's services
     const query = {
       vendorId: vendorId,
     };
 
-    // Server-side status filtering
-    const allowedStatuses = ["pending", "accepted", "rejected"];
+    // Fetch all vendor services without filtering or sorting
+    const services = await servicesCollection.find(query).toArray();
 
-    if (status && status !== "all") {
-      if (!allowedStatuses.includes(status)) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid booking status",
-        });
-      }
-
-      query.status = status;
-    }
-
-    // Fetch and sort directly from MongoDB
-    const bookings = await bookingsCollection
-      .find(query)
-      .sort({ createdAt: -1 })
+    // Calculate status counts
+    const statusCounts = await servicesCollection
+      .aggregate([
+        {
+          $match: {
+            vendorId: vendorId,
+          },
+        },
+        {
+          $group: {
+            _id: "$status",
+            count: { $sum: 1 },
+          },
+        },
+      ])
       .toArray();
+
+    const counts = {
+      pending: 0,
+      approved: 0,
+      rejected: 0,
+    };
+
+    statusCounts.forEach((item) => {
+      if (item._id in counts) {
+        counts[item._id] = item.count;
+      }
+    });
 
     return res.status(200).json({
       success: true,
-      totalBookings: bookings.length,
-      bookings,
+      totalServices: services.length,
+      counts,
+      services,
     });
   } catch (error) {
-    console.error("GET VENDOR BOOKINGS ERROR:", error);
+    console.error("GET VENDOR SERVICES ERROR:", error);
 
     return res.status(500).json({
       success: false,
-      message: "Failed to fetch bookings",
+      message: "Failed to fetch services",
+      error: error.message,
     });
   }
 });
