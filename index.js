@@ -466,6 +466,66 @@ app.get("/vendor/services", verifyInternalRequest, async (req, res) => {
 
 // ? ======== GET method end ==========
 
+// *** ======================================
+// todo GET method for vendor Booking Requests
+// ***=======================================
+
+app.get("/vendor/bookings", verifyInternalRequest, async (req, res) => {
+  try {
+    const vendorId = req.headers["x-user-id"];
+    const status = req.query.status;
+
+    if (!vendorId) {
+      return res.status(401).json({
+        success: false,
+        message: "Vendor authentication required",
+      });
+    }
+
+    // Build MongoDB query
+    const query = {
+      vendorId: vendorId,
+    };
+
+    // Server-side status filtering
+    const allowedStatuses = ["pending", "accepted", "rejected"];
+
+    if (status && status !== "all") {
+      if (!allowedStatuses.includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid booking status",
+        });
+      }
+
+      query.status = status;
+    }
+
+    // Fetch and sort directly from MongoDB
+    const bookings = await bookingsCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      totalBookings: bookings.length,
+      bookings,
+    });
+  } catch (error) {
+    console.error("GET VENDOR BOOKINGS ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch bookings",
+    });
+  }
+});
+
+// ===========================================
+// ? END
+// ===========================================
+
 // =============================================
 // 9. HOME ROUTE
 // =============================================
