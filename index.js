@@ -502,6 +502,62 @@ app.get("/vendor/services", verifyInternalRequest, async (req, res) => {
 // ? END
 // ===========================================
 
+// ????===========================================
+// ! Get single card details
+// ????===========================================
+
+// Get single vendor service details
+app.get("/vendor/services/:id", verifyInternalRequest, async (req, res) => {
+  try {
+    const vendorId = req.headers["x-user-id"];
+    const { id } = req.params;
+
+    if (!vendorId) {
+      return res.status(401).json({
+        success: false,
+        message: "Vendor authentication required",
+      });
+    }
+
+    // Validate MongoDB ObjectId
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service ID",
+      });
+    }
+
+    // Find service belonging to this vendor
+    const service = await servicesCollection.findOne({
+      _id: new ObjectId(id),
+      vendorId: vendorId,
+    });
+
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      service,
+    });
+  } catch (error) {
+    console.error("GET SINGLE SERVICE ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch service details",
+      error: error.message,
+    });
+  }
+});
+// !! end ==============================================
+// end single card details
+// !====================================================
+
 // =============================================
 // 9. HOME ROUTE
 // =============================================
