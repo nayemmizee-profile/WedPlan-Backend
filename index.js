@@ -1,86 +1,105 @@
 import cors from "cors";
 import "dotenv/config";
 import express from "express";
-import { MongoClient, ObjectId } from "mongodb";
+import { MongoClient } from "mongodb";
 import multer from "multer";
+
+// =============================================
+// 1. INITIAL SETUP
+// =============================================
 
 const app = express();
 const port = process.env.PORT || 8000;
 
-/* =========================================
-   1. MIDDLEWARE
-========================================= */
+// =============================================
+// 2. GLOBAL MIDDLEWARE
+// =============================================
 
+// JSON Request গ্রহণ করার জন্য
 app.use(express.json());
+
+// Frontend থেকে Request গ্রহণ করার জন্য
 app.use(cors());
 
-/* =========================================
-   2. MONGODB CONNECTION
-========================================= */
+// =============================================
+// 3. MONGODB CONNECTION
+// =============================================
 
-const client = new MongoClient(
-  `mongodb+srv://${process.env.DB_USER_ID}:${process.env.DB_PASSWORD}@cluster0.stvgba2.mongodb.net/`,
-);
+// Environment Variable থেকে MongoDB Credentials নেওয়া
+const dbUser = process.env.DB_USER_ID;
+const dbPassword = process.env.DB_PASSWORD;
 
-const db = client.db("WeddingDB");
+// Credentials না থাকলে Error দেখাবে
+if (!dbUser || !dbPassword) {
+  throw new Error("MongoDB credentials are missing!");
+}
 
+// MongoDB Connection URL তৈরি
+const mongoUri =
+  `mongodb+srv://${encodeURIComponent(dbUser)}:${encodeURIComponent(dbPassword)}` +
+  `@cluster0.stvgba2.mongodb.net/`;
+
+// MongoDB Client তৈরি
+const client = new MongoClient(mongoUri);
+
+// Database নির্বাচন
+const db = client.db("WEDDING_PLAN");
+
+// Database Export
 export { db };
 
-/* =========================================
-   3. COLLECTIONS
-========================================= */
+// =============================================
+// 4. DATABASE COLLECTIONS
+// =============================================
 
-// Services Collection
+// সকল Service এই Collection-এ থাকবে
 const servicesCollection = db.collection("services");
 
-// Better Auth User Collection
+// Better Auth-এর User Data এই Collection-এ থাকবে
 const usersCollection = db.collection("user");
 
-/* =========================================
-   4. MULTER CONFIGURATION
-========================================= */
+// =============================================
+// 5. MULTER IMAGE UPLOAD CONFIGURATION
+// =============================================
 
-// Multer ব্যবহার করে Frontend থেকে পাঠানো Image File গ্রহণ করব।
-//
-// memoryStorage() ব্যবহার করার কারণে Image Server-এর
-// Local Folder-এ Save হবে না। বরং RAM-এ থাকবে।
-//
-// এরপর সেই Image সরাসরি ImgBB-তে Upload করব।
-//
-// সর্বোচ্চ ৫টি Image নেওয়া যাবে।
-// প্রতিটি Image সর্বোচ্চ ৫ MB হতে পারবে।
-
+// Image Memory-তে রাখার জন্য Storage তৈরি
 const storage = multer.memoryStorage();
 
+// Multer Configuration
 const upload = multer({
-  storage: storage,
+  storage,
+
+  // File Size এবং সংখ্যা নির্ধারণ
   limits: {
-    fileSize: 5 * 1024 * 1024,
-    files: 5,
+    fileSize: 5 * 1024 * 1024, // Maximum 5 MB
+    files: 5, // Maximum 5 Images
+  },
+
+  // শুধুমাত্র Image File গ্রহণ করা হবে
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith("image/")) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only image files are allowed!"));
+    }
   },
 });
 
-/* =========================================
-   5. INTERNAL REQUEST VERIFICATION
-========================================= */
+// =============================================
+// 6. INTERNAL REQUEST VERIFICATION
+// =============================================
 
-// Frontend সরাসরি Express Backend-এ Request পাঠাবে না।
-// Next.js API Route-এর মাধ্যমে Request আসবে।
-//
-// Next.js API Route থেকে একটি Secret পাঠানো হবে।
-// এখানে সেই Secret যাচাই করা হবে।
-//
-// Secret ভুল হলে Request গ্রহণ করা হবে না।
-//
-// গুরুত্বপূর্ণ:
-// এই Middleware Multer-এর আগে ব্যবহার করা হয়েছে,
-// যাতে Unauthorized Request-এর Image Upload-এর জন্য
-// Server-এর Memory ব্যবহার না হয়।
-
+// শুধুমাত্র Next.js API Route থেকে আসা
+// Authorized Request গ্রহণ করার জন্য
 const verifyInternalRequest = (req, res, next) => {
   const secret = req.headers["x-internal-secret"];
 
-  if (!secret || secret !== process.env.INTERNAL_API_SECRET) {
+  // Internal Secret যাচাই
+  if (
+    !secret ||
+    !process.env.INTERNAL_API_SECRET ||
+    secret !== process.env.INTERNAL_API_SECRET
+  ) {
     return res.status(401).json({
       success: false,
       message: "Unauthorized access",
@@ -90,103 +109,96 @@ const verifyInternalRequest = (req, res, next) => {
   next();
 };
 
-/* =========================================
-   6. IMGBB IMAGE UPLOAD FUNCTION
-========================================= */
+// =============================================
+// 7. IMGBB IMAGE UPLOAD FUNCTION
+// =============================================
 
-// এই Function-এর কাজ হচ্ছে Frontend থেকে পাওয়া
-// Image File ImgBB Server-এ Upload করা।
-//
-// Upload সফল হলে ImgBB আমাদের একটি Image URL দেবে।
-// সেই URL আমরা MongoDB-তে Save করব।
-//
-// Image Binary Data MongoDB-তে Save করছি না।
-
+// Image ImgBB-তে Upload করে URL Return করবে
 const uploadToImgBB = async (file) => {
-  const formData = new FormData();
+  try {
+    // ImgBB API Key সংগ্রহ
+    const apiKey = process.env.IMGBB_API_KEY;
 
-  const imageBlob = new Blob([file.buffer], {
-    type: file.mimetype,
-  });
+    if (!apiKey) {
+      throw new Error("ImgBB API Key is missing!");
+    }
 
-  formData.append("image", imageBlob, file.originalname);
+    // FormData তৈরি
+    const formData = new FormData();
 
-  const response = await fetch(
-    `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
-    {
+    // Buffer থেকে Blob তৈরি
+    const imageBlob = new Blob([file.buffer], {
+      type: file.mimetype,
+    });
+
+    // Image FormData-তে যুক্ত
+    formData.append("image", imageBlob, file.originalname);
+
+    // সঠিক ImgBB API URL
+    const imgBBUrl = `https://api.imgbb.com/1/upload?key=${encodeURIComponent(apiKey)}`;
+
+    // ImgBB API-তে Image পাঠানো
+    const response = await fetch(imgBBUrl, {
       method: "POST",
       body: formData,
-    },
-  );
+    });
 
-  const result = await response.json();
+    // API Response JSON-এ Convert
+    const result = await response.json();
 
-  if (!response.ok || !result.success) {
-    throw new Error("Image upload failed");
+    console.log("ImgBB Response Status:", response.status);
+
+    // Upload সফল হয়েছে কিনা যাচাই
+    if (!response.ok || !result.success) {
+      throw new Error(result.error?.message || "ImgBB image upload failed");
+    }
+
+    // Uploaded Image URL Return
+    return result.data.url;
+  } catch (error) {
+    console.error("IMGBB UPLOAD ERROR:", error);
+
+    // মূল Error পরবর্তী Catch Block-এ পাঠানো
+    throw error;
   }
-
-  return result.data.url;
 };
 
-/* =========================================
-   7. ADD NEW SERVICE API
-========================================= */
-
-// API Endpoint: POST /services
-//
-// এই API ব্যবহার করে Vendor নতুন Service Add করতে পারবে।
-//
-// Frontend থেকে FormData পাঠাতে হবে।
-//
-// FormData-এর মধ্যে থাকবে:
-// 1. serviceName
-// 2. category
-// 3. description
-// 4. price
-// 5. location
-// 6. images (একাধিক Image)
-//
-// Vendor ID Frontend থেকে সরাসরি বিশ্বাস করা হবে না।
-// Next.js API Route-এর Trusted Header থেকে নেওয়া হবে।
+// =============================================
+// 8. ADD NEW SERVICE API
+// =============================================
 
 app.post(
   "/services",
+
+  // Step 1: Internal Request যাচাই
   verifyInternalRequest,
+
+  // Step 2: সর্বোচ্চ ৫টি Image গ্রহণ
   upload.array("images", 5),
+
   async (req, res) => {
     try {
-      /* -----------------------------------------
-         STEP 1: GET VENDOR ID
-      ----------------------------------------- */
+      // -----------------------------------------
+      // STEP 1: GET VENDOR EMAIL
+      // -----------------------------------------
 
-      // Next.js API Route থেকে Vendor ID আসবে।
-      // x-user-id Header-এর মাধ্যমে পাঠানো হবে।
+      // Next.js API Route থেকে Verified Session-এর
+      // Email গ্রহণ করা হচ্ছে
+      // STEP 1: GET VENDOR INFORMATION
 
-      const vendorId = req.headers["x-user-id"];
-      console.log("Vendor ID from header:", vendorId);
+      const vendorEmail = req.headers["x-user-email"];
+      const userId = req.headers["x-user-id"];
 
-      console.log("User collection name:", usersCollection.collectionName);
-
-      const allUsers = await usersCollection.find({}).limit(5).toArray();
-
-      console.log("Users from database:", allUsers);
-
-      if (!vendorId) {
+      if (!vendorEmail || !userId) {
         return res.status(400).json({
           success: false,
-          message: "Vendor ID is required",
+          message: "Vendor information is required",
         });
       }
 
-      /* -----------------------------------------
-         STEP 2: FIND VENDOR
-      ----------------------------------------- */
-
-      // Better Auth-এর User Collection থেকে Vendor খুঁজব।
-      // এখানে ধরে নেওয়া হয়েছে User ID Field-এর নাম "id"।
-
+      // Find vendor
       const vendor = await usersCollection.findOne({
-        _id: new ObjectId(vendorId),
+        email: vendorEmail,
       });
 
       if (!vendor) {
@@ -196,13 +208,15 @@ app.post(
         });
       }
 
-      /* -----------------------------------------
-         STEP 3: CHECK USER ROLE
-      ----------------------------------------- */
+      // Verify MongoDB ID against Better Auth ID
+      if (vendor._id.toString() !== userId) {
+        return res.status(403).json({
+          success: false,
+          message: "Vendor ID does not match",
+        });
+      }
 
-      // শুধুমাত্র Vendor-রাই Service Add করতে পারবে।
-      // Customer বা Admin এই API ব্যবহার করতে পারবে না।
-
+      // Verify role
       if (vendor.role !== "vendor") {
         return res.status(403).json({
           success: false,
@@ -210,13 +224,39 @@ app.post(
         });
       }
 
-      /* -----------------------------------------
-         STEP 4: CHECK BLOCKED STATUS
-      ----------------------------------------- */
+      const vendorId = vendor._id.toString();
 
-      // Admin যদি কোনো Vendor-কে Block করে,
-      // তাহলে সেই Vendor নতুন Service Add করতে পারবে না।
+      console.log("Received User ID:", req.headers["x-user-id"]);
+      console.log("Received User Email:", req.headers["x-user-email"]);
 
+      const allVendors = await usersCollection
+        .find({
+          role: "vendor",
+        })
+        .toArray();
+
+      console.log("Available Vendors:", allVendors);
+
+      // MongoDB-এর প্রকৃত Vendor ID সংগ্রহ
+
+      // -----------------------------------------
+      // STEP 3: CHECK VENDOR ROLE
+      // -----------------------------------------
+
+      // শুধুমাত্র Vendor Service Add করতে পারবে
+      if (vendor.role !== "vendor") {
+        return res.status(403).json({
+          success: false,
+          message: "Only vendors can add services",
+        });
+      }
+
+      // -----------------------------------------
+      // STEP 4: CHECK BLOCKED STATUS
+      // -----------------------------------------
+
+      // Admin Vendor-কে Block করলে
+      // Service Add করতে পারবে না
       if (vendor.isBlocked === true) {
         return res.status(403).json({
           success: false,
@@ -224,36 +264,21 @@ app.post(
         });
       }
 
-      /* -----------------------------------------
-         STEP 5: CHECK SUBSCRIPTION PLAN
-      ----------------------------------------- */
+      // -----------------------------------------
+      // STEP 5: CHECK SUBSCRIPTION PLAN
+      // -----------------------------------------
 
-      // Vendor-এর Subscription Premium কি না যাচাই করব।
-      //
-      // Premium Plan-এর মেয়াদ শেষ না হলে Unlimited
-      // Service Add করতে পারবে।
-      //
-      // Free Plan-এর Vendor সর্বোচ্চ ৩টি Service Add
-      // করতে পারবে।
-
+      // Vendor-এর Premium Subscription যাচাই
       const isPremium =
         vendor.subscriptionPlan === "premium" &&
         vendor.subscriptionExpiresAt &&
         new Date(vendor.subscriptionExpiresAt) > new Date();
 
-      /* -----------------------------------------
-         STEP 6: FREE PLAN SERVICE LIMIT
-      ----------------------------------------- */
+      // -----------------------------------------
+      // STEP 6: FREE PLAN SERVICE LIMIT
+      // -----------------------------------------
 
-      // Premium না হলে Vendor-এর মোট Service গণনা করব।
-      //
-      // Pending, Approved এবং Rejected সব Service
-      // এই গণনার মধ্যে থাকবে।
-      //
-      // ৩টি Service হয়ে গেলে নতুন Service Add করতে পারবে না।
-      // তখন Frontend-কে Upgrade Page-এ পাঠানোর জন্য
-      // upgradeRequired: true পাঠানো হবে।
-
+      // Premium না হলে সর্বোচ্চ ৩টি Service Add করতে পারবে
       if (!isPremium) {
         const totalServices = await servicesCollection.countDocuments({
           vendorId: vendorId,
@@ -269,26 +294,30 @@ app.post(
         }
       }
 
-      /* -----------------------------------------
-         STEP 7: GET FORM DATA
-      ----------------------------------------- */
+      // -----------------------------------------
+      // STEP 7: GET FORM DATA
+      // -----------------------------------------
 
-      // Frontend-এর FormData থেকে Service-এর তথ্য নিচ্ছি।
-
+      // Frontend FormData থেকে Service Information নেওয়া
       const { serviceName, category, description, price, location } = req.body;
 
-      /* -----------------------------------------
-         STEP 8: VALIDATE FORM DATA
-      ----------------------------------------- */
+      // -----------------------------------------
+      // STEP 8: VALIDATE FORM DATA
+      // -----------------------------------------
 
-      // প্রয়োজনীয় কোনো Field খালি থাকলে Request গ্রহণ করব না।
-
+      // Required Fields যাচাই
       if (
-        !serviceName?.trim() ||
-        !category?.trim() ||
-        !description?.trim() ||
-        !price ||
-        !location?.trim()
+        typeof serviceName !== "string" ||
+        !serviceName.trim() ||
+        typeof category !== "string" ||
+        !category.trim() ||
+        typeof description !== "string" ||
+        !description.trim() ||
+        price === undefined ||
+        price === null ||
+        price === "" ||
+        typeof location !== "string" ||
+        !location.trim()
       ) {
         return res.status(400).json({
           success: false,
@@ -296,10 +325,14 @@ app.post(
         });
       }
 
-      // Price অবশ্যই একটি Valid Positive Number হতে হবে।
+      // -----------------------------------------
+      // STEP 9: VALIDATE PRICE
+      // -----------------------------------------
 
+      // Price Number-এ Convert
       const servicePrice = Number(price);
 
+      // Positive Number কিনা যাচাই
       if (!Number.isFinite(servicePrice) || servicePrice <= 0) {
         return res.status(400).json({
           success: false,
@@ -307,12 +340,11 @@ app.post(
         });
       }
 
-      /* -----------------------------------------
-         STEP 9: VALIDATE IMAGE FILES
-      ----------------------------------------- */
+      // -----------------------------------------
+      // STEP 10: VALIDATE IMAGES
+      // -----------------------------------------
 
-      // অন্তত একটি Image Upload করতে হবে।
-
+      // অন্তত একটি Image Upload করতে হবে
       if (!req.files || req.files.length === 0) {
         return res.status(400).json({
           success: false,
@@ -320,105 +352,132 @@ app.post(
         });
       }
 
-      /* -----------------------------------------
-         STEP 10: UPLOAD IMAGES TO IMGBB
-      ----------------------------------------- */
+      // -----------------------------------------
+      // STEP 11: UPLOAD IMAGES TO IMGBB
+      // -----------------------------------------
 
-      // প্রতিটি Image ImgBB-তে Upload হবে।
-      //
-      // Promise.all() ব্যবহার করার কারণে একাধিক Image
-      // একসঙ্গে Upload হবে।
-      //
-      // Upload সফল হলে Image URL-গুলো imageUrls Array-তে
-      // পাওয়া যাবে।
-
+      // সকল Image ImgBB-তে Upload
       const imageUrls = await Promise.all(
         req.files.map((file) => uploadToImgBB(file)),
       );
 
-      /* -----------------------------------------
-         STEP 11: CREATE SERVICE DOCUMENT
-      ----------------------------------------- */
+      console.log("Images uploaded successfully:", imageUrls.length);
 
-      // MongoDB-তে Save করার জন্য নতুন Object তৈরি করছি।
-      //
-      // status: "pending" রাখা হয়েছে।
-      // অর্থাৎ Admin Approve না করা পর্যন্ত Service
-      // Public Website-এ দেখানো উচিত নয়।
+      // -----------------------------------------
+      // STEP 12: CREATE SERVICE DOCUMENT
+      // -----------------------------------------
 
+      // MongoDB-তে Save করার জন্য Service Object
       const newService = {
+        // Vendor Information
         vendorId: vendorId,
+        vendorName: vendor.name,
+        vendorEmail: vendor.email,
+
+        // Service Information
         serviceName: serviceName.trim(),
         category: category.trim(),
         description: description.trim(),
         price: servicePrice,
         location: location.trim(),
+
+        // Uploaded Image URLs
         images: imageUrls,
+
+        // Admin Approval-এর জন্য Default Status
         status: "pending",
+
+        // Creation এবং Update Date
         createdAt: new Date(),
+        updatedAt: new Date(),
       };
 
-      /* -----------------------------------------
-         STEP 12: INSERT INTO MONGODB
-      ----------------------------------------- */
-
-      // Services Collection-এ নতুন Service Insert করছি।
+      // -----------------------------------------
+      // STEP 13: INSERT INTO MONGODB
+      // -----------------------------------------
 
       const result = await servicesCollection.insertOne(newService);
 
-      /* -----------------------------------------
-         STEP 13: SEND SUCCESS RESPONSE
-      ----------------------------------------- */
-
-      // Insert সফল হলে Frontend-এ Success Response পাঠাব।
+      // -----------------------------------------
+      // STEP 14: SEND SUCCESS RESPONSE
+      // -----------------------------------------
 
       return res.status(201).json({
         success: true,
         message: "Service added successfully. Waiting for admin approval.",
+
         serviceId: result.insertedId,
-        service: newService,
+
+        service: {
+          ...newService,
+          _id: result.insertedId,
+        },
       });
     } catch (error) {
-      /* -----------------------------------------
-         ERROR HANDLING
-      ----------------------------------------- */
+      // -----------------------------------------
+      // ERROR HANDLING
+      // -----------------------------------------
 
-      console.error("Add Service Error:", error);
+      console.error("ADD SERVICE ERROR:", error);
 
       return res.status(500).json({
         success: false,
         message: "Failed to add service",
         error: error.message,
+        cause: error.cause?.message || null,
       });
     }
   },
 );
 
-/* =========================================
-   8. HOME ROUTE
-========================================= */
+// =============================================
+// 9. HOME ROUTE
+// =============================================
 
+// Backend Server সচল আছে কিনা পরীক্ষা
 app.get("/", (req, res) => {
   res.send("Hello World!");
 });
 
-/* =========================================
-   9. START MONGODB CONNECTION
-========================================= */
+// =============================================
+// 10. GLOBAL ERROR HANDLER
+// =============================================
+
+// Multer এবং অন্যান্য Middleware-এর Error Handle
+app.use((error, req, res, next) => {
+  console.error("GLOBAL ERROR:", error);
+
+  // Multer Error Handle
+  if (error instanceof multer.MulterError) {
+    return res.status(400).json({
+      success: false,
+      message: error.message,
+    });
+  }
+
+  // অন্য Middleware Error
+  return res.status(400).json({
+    success: false,
+    message: error.message || "Something went wrong",
+  });
+});
+
+// =============================================
+// 11. CONNECT DATABASE AND START SERVER
+// =============================================
+
+// MongoDB Connection সফল হওয়ার পর Express Server চালু
+// এখানে startServer() ব্যবহার করা হচ্ছে না
 
 client
   .connect()
   .then(() => {
     console.log("Successfully connected to MongoDB!");
+
+    app.listen(port, () => {
+      console.log(`Server listening on port ${port}`);
+    });
   })
   .catch((error) => {
     console.error("MongoDB connection failed:", error);
   });
-
-/* =========================================
-   10. SERVER
-========================================= */
-
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
-});
