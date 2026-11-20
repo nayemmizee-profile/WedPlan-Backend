@@ -430,6 +430,42 @@ app.post(
   },
 );
 
+// !!! GET METHOD for VENDOR service==============>
+// !!! GET METHOD for VENDOR service==============>
+
+app.get("/vendor/services", verifyInternalRequest, async (req, res) => {
+  try {
+    const vendorEmail = req.headers["x-user-email"];
+
+    if (!vendorEmail) {
+      return res.status(401).json({
+        success: false,
+        message: "Vendor email is required",
+      });
+    }
+
+    const services = await servicesCollection
+      .find({ vendorEmail: vendorEmail })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      totalServices: services.length,
+      services,
+    });
+  } catch (error) {
+    console.error("Fetch Vendor Services Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch vendor services",
+    });
+  }
+});
+
+// ? ======== GET method end ==========
+
 // =============================================
 // 9. HOME ROUTE
 // =============================================
