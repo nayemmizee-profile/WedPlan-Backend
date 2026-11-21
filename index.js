@@ -1,7 +1,7 @@
 import cors from "cors";
 import "dotenv/config";
 import express from "express";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 import multer from "multer";
 
 // =============================================
@@ -690,14 +690,14 @@ app.patch("/admin/users/:id/block", verifyAdmin, async (req, res) => {
 
     const targetId = String(user._id || user.id);
 
-    // Admin Cannot Be Blocked
     if (adminUserIds.includes(targetId)) {
       return res.status(403).json({
         success: false,
-        message: "Admin accounts cannot be blocked here",
+        message: "Admin cannot be blocked",
       });
     }
 
+    // User-কে Block করা
     await usersCollection.updateOne(
       { _id: user._id },
       {
@@ -709,7 +709,7 @@ app.patch("/admin/users/:id/block", verifyAdmin, async (req, res) => {
       },
     );
 
-    // Delete Existing User Sessions
+    // আগের Login Session বাতিল করা
     await db.collection("session").deleteMany({
       userId: targetId,
     });
@@ -724,6 +724,7 @@ app.patch("/admin/users/:id/block", verifyAdmin, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to block user",
+      error: error.message,
     });
   }
 });
@@ -773,6 +774,7 @@ app.patch("/admin/users/:id/unblock", verifyAdmin, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to unblock user",
+      error: error.message,
     });
   }
 });
@@ -831,7 +833,7 @@ app.get("/admin/services", verifyAdmin, async (req, res) => {
     const data = await Promise.all(
       services.map(async (service) => {
         const vendor = service.vendorId
-          ? await userCollection.findOne(getIdFilter(String(service.vendorId)))
+          ? await usersCollection.findOne(getIdFilter(String(service.vendorId)))
           : null;
 
         return {
