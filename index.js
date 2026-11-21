@@ -518,16 +518,22 @@ app.get("/vendor/services", verifyInternalRequest, async (req, res) => {
 //! ADMIN middleware
 // =================================================
 
+/* =================================================
+   ADMIN MIDDLEWARE & HELPERS
+================================================= */
+
+// Admin User IDs
 const adminUserIds = (process.env.ADMIN_USER_IDS || "")
   .split(",")
   .map((id) => id.trim())
   .filter(Boolean);
 
-// Admin verification
+// Admin Verification Middleware
 const verifyAdmin = (req, res, next) => {
   const secret = req.headers["x-internal-secret"];
   const userId = req.headers["x-user-id"];
 
+  // Verify internal secret
   if (
     !process.env.INTERNAL_API_SECRET ||
     secret !== process.env.INTERNAL_API_SECRET
@@ -538,6 +544,7 @@ const verifyAdmin = (req, res, next) => {
     });
   }
 
+  // Verify Admin User ID
   if (!adminUserIds.includes(String(userId || ""))) {
     return res.status(403).json({
       success: false,
@@ -548,7 +555,7 @@ const verifyAdmin = (req, res, next) => {
   next();
 };
 
-// MongoDB ID helper
+// MongoDB ID Helper
 const getIdFilter = (id) => {
   if (ObjectId.isValid(id)) {
     return {
@@ -561,7 +568,7 @@ const getIdFilter = (id) => {
   };
 };
 
-// Safe public user data
+// Remove Password from User Data
 const safeUser = (user) => {
   if (!user) return null;
 
@@ -573,41 +580,48 @@ const safeUser = (user) => {
   };
 };
 
-// Escape search input
+// Escape Regex Special Characters
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// =========================================
+/* =================================================
+   ADMIN USER MANAGEMENT
+================================================= */
+
+// GET: Fetch All Users with Search, Role & Pagination
 app.get("/admin/users", verifyAdmin, async (req, res) => {
   try {
     const { search = "", role = "", page = 1, limit = 10 } = req.query;
 
     const currentPage = Math.max(1, Number(page) || 1);
-
     const pageLimit = Math.min(50, Math.max(1, Number(limit) || 10));
 
     const filter = {};
 
+    // Role Filter
     if (role) {
       filter.role = role;
     }
 
+    // Search by Name or Email
     if (search.trim()) {
       const regex = new RegExp(escapeRegex(search.trim()), "i");
 
       filter.$or = [{ name: regex }, { email: regex }];
     }
 
+    // Fetch Users and Total Count
     const [users, total] = await Promise.all([
-      userCollection
+      usersCollection
         .find(filter)
         .sort({ createdAt: -1 })
         .skip((currentPage - 1) * pageLimit)
         .limit(pageLimit)
         .toArray(),
 
-      userCollection.countDocuments(filter),
+      usersCollection.countDocuments(filter),
     ]);
 
+    // Format User Data
     const data = users.map((user) => ({
       ...safeUser(user),
       isAdmin: adminUserIds.includes(String(user._id || user.id)),
@@ -615,7 +629,6 @@ app.get("/admin/users", verifyAdmin, async (req, res) => {
 
     res.json({
       success: true,
-
       data: {
         users: data,
         total,
@@ -625,6 +638,8 @@ app.get("/admin/users", verifyAdmin, async (req, res) => {
       },
     });
   } catch (error) {
+    console.error("Admin Users Error:", error);
+
     res.status(500).json({
       success: false,
       message: "Failed to fetch users",
@@ -632,10 +647,10 @@ app.get("/admin/users", verifyAdmin, async (req, res) => {
   }
 });
 
-// =================================================
+// GET: Fetch Single User Details
 app.get("/admin/users/:id", verifyAdmin, async (req, res) => {
   try {
-    const user = await userCollection.findOne(getIdFilter(req.params.id));
+    const user = await usersCollection.findOne(getIdFilter(req.params.id));
 
     if (!user) {
       return res.status(404).json({
@@ -652,6 +667,8 @@ app.get("/admin/users/:id", verifyAdmin, async (req, res) => {
       },
     });
   } catch (error) {
+    console.error("User Details Error:", error);
+
     res.status(500).json({
       success: false,
       message: "Failed to fetch user details",
@@ -659,10 +676,62 @@ app.get("/admin/users/:id", verifyAdmin, async (req, res) => {
   }
 });
 
-// ================================================
+// PATCH: Block User
 app.patch("/admin/users/:id/block", verifyAdmin, async (req, res) => {
   try {
-    const user = await userCollection.findOne(getIdFilter(req.params.id));
+    const user = await usersCollection.findOne(getIdFilter(req.params.id));
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    const targetId = String(user._id || user.id);
+
+    // Admin Cannot Be Blocked
+    if (adminUserIds.includes(targetId)) {
+      return res.status(403).json({
+        success: false,
+        message: "Admin accounts cannot be blocked here",
+      });
+    }
+
+    await usersCollection.updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          banned: true,
+          banReason: "Blocked by administrator",
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    // Delete Existing User Sessions
+    await db.collection("session").deleteMany({
+      userId: targetId,
+    });
+
+    res.json({
+      success: true,
+      message: "User blocked successfully",
+    });
+  } catch (error) {
+    console.error("Block User Error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to block user",
+    });
+  }
+});
+
+// PATCH: Unblock User
+app.patch("/admin/users/:id/unblock", verifyAdmin, async (req, res) => {
+  try {
+    const user = await usersCollection.findOne(getIdFilter(req.params.id));
 
     if (!user) {
       return res.status(404).json({
@@ -676,57 +745,11 @@ app.patch("/admin/users/:id/block", verifyAdmin, async (req, res) => {
     if (adminUserIds.includes(targetId)) {
       return res.status(403).json({
         success: false,
-        message: "Admin accounts cannot be blocked here",
-      });
-    }
-
-    await userCollection.updateOne(
-      { _id: user._id },
-      {
-        $set: {
-          banned: true,
-          banReason: "Blocked by administrator",
-          updatedAt: new Date(),
-        },
-      },
-    );
-
-    // Revoke existing sessions
-    await db.collection("session").deleteMany({
-      userId: targetId,
-    });
-
-    res.json({
-      success: true,
-      message: "User blocked successfully",
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to block user",
-    });
-  }
-});
-// ================================================
-app.patch("/admin/users/:id/unblock", verifyAdmin, async (req, res) => {
-  try {
-    const user = await userCollection.findOne(getIdFilter(req.params.id));
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found",
-      });
-    }
-
-    if (adminUserIds.includes(String(user._id || user.id))) {
-      return res.status(403).json({
-        success: false,
         message: "Invalid operation",
       });
     }
 
-    await userCollection.updateOne(
+    await usersCollection.updateOne(
       { _id: user._id },
       {
         $set: {
@@ -745,19 +768,27 @@ app.patch("/admin/users/:id/unblock", verifyAdmin, async (req, res) => {
       message: "User unblocked successfully",
     });
   } catch (error) {
+    console.error("Unblock User Error:", error);
+
     res.status(500).json({
       success: false,
       message: "Failed to unblock user",
     });
   }
 });
-// ===============================================
+
+/* =================================================
+   ADMIN SERVICE MANAGEMENT
+================================================= */
+
+// GET: Fetch All Services with Search & Status Filter
 app.get("/admin/services", verifyAdmin, async (req, res) => {
   try {
     const { search = "", status = "" } = req.query;
 
     const filter = {};
 
+    // Status Filter
     if (status) {
       filter.$or = [
         { approvalStatus: status },
@@ -768,6 +799,7 @@ app.get("/admin/services", verifyAdmin, async (req, res) => {
       ];
     }
 
+    // Search Services
     if (search.trim()) {
       const regex = new RegExp(escapeRegex(search.trim()), "i");
 
@@ -789,11 +821,13 @@ app.get("/admin/services", verifyAdmin, async (req, res) => {
       }
     }
 
+    // Fetch Services
     const services = await servicesCollection
       .find(filter)
       .sort({ createdAt: -1 })
       .toArray();
 
+    // Attach Vendor Information
     const data = await Promise.all(
       services.map(async (service) => {
         const vendor = service.vendorId
@@ -815,15 +849,20 @@ app.get("/admin/services", verifyAdmin, async (req, res) => {
       data,
     });
   } catch (error) {
-    console.error("Admin Services:", error);
+    console.error("========== ADMIN SERVICES ERROR ==========");
+    console.error("Error Message:", error.message);
+    console.error("Error Stack:", error.stack);
+    console.error("===========================================");
 
     res.status(500).json({
       success: false,
       message: "Failed to fetch services",
+      error: error.message,
     });
   }
 });
-// =============================================
+
+// PATCH: Approve Service
 app.patch("/admin/services/:id/approve", verifyAdmin, async (req, res) => {
   try {
     const result = await servicesCollection.updateOne(
@@ -850,13 +889,16 @@ app.patch("/admin/services/:id/approve", verifyAdmin, async (req, res) => {
       message: "Service approved successfully",
     });
   } catch (error) {
+    console.error("Approve Service Error:", error);
+
     res.status(500).json({
       success: false,
       message: "Failed to approve service",
     });
   }
 });
-// ==============================================app.patch(
+
+// PATCH: Reject Service
 app.patch("/admin/services/:id/reject", verifyAdmin, async (req, res) => {
   try {
     const result = await servicesCollection.updateOne(
@@ -883,13 +925,16 @@ app.patch("/admin/services/:id/reject", verifyAdmin, async (req, res) => {
       message: "Service rejected successfully",
     });
   } catch (error) {
+    console.error("Reject Service Error:", error);
+
     res.status(500).json({
       success: false,
       message: "Failed to reject service",
     });
   }
 });
-// ===============================================
+
+// PATCH: Activate / Deactivate Service
 app.patch("/admin/services/:id/status", verifyAdmin, async (req, res) => {
   try {
     const { isActive } = req.body;
@@ -897,32 +942,12 @@ app.patch("/admin/services/:id/status", verifyAdmin, async (req, res) => {
     if (typeof isActive !== "boolean") {
       return res.status(400).json({
         success: false,
-        message: "isActive must be true or false",
+        message: "Valid isActive value is required",
       });
     }
 
-    const service = await servicesCollection.findOne(
+    const result = await servicesCollection.updateOne(
       getIdFilter(req.params.id),
-    );
-
-    if (!service) {
-      return res.status(404).json({
-        success: false,
-        message: "Service not found",
-      });
-    }
-
-    const approval = service.approvalStatus || service.status;
-
-    if (approval !== "approved") {
-      return res.status(400).json({
-        success: false,
-        message: "Only approved services can be activated",
-      });
-    }
-
-    await servicesCollection.updateOne(
-      { _id: service._id },
       {
         $set: {
           isActive,
@@ -931,20 +956,28 @@ app.patch("/admin/services/:id/status", verifyAdmin, async (req, res) => {
       },
     );
 
+    if (!result.matchedCount) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
     res.json({
       success: true,
-      message: isActive
-        ? "Service activated successfully"
-        : "Service deactivated successfully",
+      message: `Service ${isActive ? "activated" : "deactivated"} successfully`,
     });
   } catch (error) {
+    console.error("Service Status Error:", error);
+
     res.status(500).json({
       success: false,
-      message: "Failed to change service status",
+      message: "Failed to update service status",
     });
   }
 });
-// ===============================================
+
+// DELETE: Delete Service
 app.delete("/admin/services/:id", verifyAdmin, async (req, res) => {
   try {
     const result = await servicesCollection.deleteOne(
@@ -963,6 +996,8 @@ app.delete("/admin/services/:id", verifyAdmin, async (req, res) => {
       message: "Service deleted successfully",
     });
   } catch (error) {
+    console.error("Delete Service Error:", error);
+
     res.status(500).json({
       success: false,
       message: "Failed to delete service",
@@ -970,72 +1005,137 @@ app.delete("/admin/services/:id", verifyAdmin, async (req, res) => {
   }
 });
 
-// ==============================================
-// ! transection
-// ==============================================
-app.get("/admin/transactions", verifyAdmin, async (req, res) => {
-  try {
-    const { search = "" } = req.query;
+// =================================================
+// ADMIN DASHBOARD OVERVIEW
+// =================================================
 
-    const transactions = await transactionsCollection
-      .find({})
-      .sort({ createdAt: -1 })
+app.get("/admin/overview", verifyAdmin, async (req, res) => {
+  try {
+    // 1. Total Users
+    const totalUsers = await usersCollection.countDocuments();
+
+    // 2. Total Services
+    const totalServices = await servicesCollection.countDocuments();
+
+    // 3. Total Bookings
+    const totalBookings = await bookingsCollection.countDocuments();
+
+    // 4. Total Transactions
+    const totalTransactions = await transactionsCollection.countDocuments();
+
+    const totalVendors = await usersCollection.countDocuments({
+      $or: [{ role: "vendor" }, { accountType: "vendor" }],
+    });
+
+    const totalCustomers = await usersCollection.countDocuments({
+      $or: [{ role: "user" }, { accountType: "user" }],
+    });
+
+    // 5. Service Statistics
+    const serviceStats = await servicesCollection
+      .aggregate([
+        {
+          $addFields: {
+            finalStatus: {
+              $ifNull: ["$approvalStatus", { $ifNull: ["$status", "pending"] }],
+            },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+
+            pendingServices: {
+              $sum: {
+                $cond: [{ $eq: ["$finalStatus", "pending"] }, 1, 0],
+              },
+            },
+
+            approvedServices: {
+              $sum: {
+                $cond: [{ $eq: ["$finalStatus", "approved"] }, 1, 0],
+              },
+            },
+
+            rejectedServices: {
+              $sum: {
+                $cond: [{ $eq: ["$finalStatus", "rejected"] }, 1, 0],
+              },
+            },
+
+            activeServices: {
+              $sum: {
+                $cond: [{ $eq: ["$isActive", true] }, 1, 0],
+              },
+            },
+
+            inactiveServices: {
+              $sum: {
+                $cond: [{ $eq: ["$isActive", false] }, 1, 0],
+              },
+            },
+          },
+        },
+      ])
       .toArray();
 
-    const data = await Promise.all(
-      transactions.map(async (transaction) => {
-        const vendor = transaction.vendorId
-          ? await userCollection.findOne(
-              getIdFilter(String(transaction.vendorId)),
-            )
-          : null;
+    // 6. Default Statistics
+    const stats = serviceStats[0] || {
+      pendingServices: 0,
+      approvedServices: 0,
+      rejectedServices: 0,
+      activeServices: 0,
+      inactiveServices: 0,
+    };
 
-        return {
-          ...transaction,
-          id: String(transaction._id),
+    // 7. Recent Services
+    const recentServices = await servicesCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .toArray();
 
-          vendorName: vendor?.name || "Unknown Vendor",
-          vendorEmail: vendor?.email || "",
-
-          plan: transaction.plan || "N/A",
-          amount: transaction.amount || 0,
-          currency: transaction.currency || "BDT",
-          status: transaction.status || "pending",
-        };
-      }),
-    );
-
-    const keyword = search.trim().toLowerCase();
-
-    const filtered = keyword
-      ? data.filter((item) =>
-          [
-            item.vendorName,
-            item.vendorEmail,
-            item.stripeSessionId,
-            item.stripeSubscriptionId,
-            item.plan,
-          ].some((value) =>
-            String(value || "")
-              .toLowerCase()
-              .includes(keyword),
-          ),
-        )
-      : data;
-
-    res.json({
+    // 8. Dashboard Response
+    res.status(200).json({
       success: true,
-      data: filtered,
+      message: "Admin dashboard data fetched successfully",
+
+      overview: {
+        totalUsers,
+        totalVendors,
+        totalCustomers,
+
+        totalServices,
+        totalBookings,
+        totalTransactions,
+
+        pendingServices: stats.pendingServices,
+        approvedServices: stats.approvedServices,
+        rejectedServices: stats.rejectedServices,
+        activeServices: stats.activeServices,
+        inactiveServices: stats.inactiveServices,
+      },
+
+      recentServices: recentServices.map((service) => ({
+        ...service,
+        id: String(service._id),
+        approvalStatus: service.approvalStatus || service.status || "pending",
+      })),
     });
   } catch (error) {
-    console.error("Admin Transactions:", error);
+    console.error("ADMIN OVERVIEW ERROR:", error);
 
     res.status(500).json({
       success: false,
-      message: "Failed to fetch transactions",
+      message: "Failed to fetch admin overview",
+      error: error.message,
     });
   }
 });
+
+/* =================================================
+   END ADMIN ROUTES
+================================================= */
 
 // =============================================
 // 9. HOME ROUTE
