@@ -58,6 +58,10 @@ const servicesCollection = db.collection("services");
 // Better Auth-এর User Data এই Collection-এ থাকবে
 const usersCollection = db.collection("user");
 
+const transactionsCollection = db.collection("transactions");
+
+const bookingsCollection = db.collection("bookings");
+
 // =============================================
 // 5. MULTER IMAGE UPLOAD CONFIGURATION
 // =============================================
@@ -502,36 +506,404 @@ app.get("/vendor/services", verifyInternalRequest, async (req, res) => {
 // ? END
 // ===========================================
 
-// ????===========================================
-// ! Get single card details
-// ????===========================================
+// ===========================================
+//  Get single card details
+// ===========================================
 
-// Get single vendor service details
-app.get("/vendor/services/:id", verifyInternalRequest, async (req, res) => {
+//  end ==============================================
+// end single card details
+// ====================================================
+
+// =================================================
+//! ADMIN middleware
+// =================================================
+
+const adminUserIds = (process.env.ADMIN_USER_IDS || "")
+  .split(",")
+  .map((id) => id.trim())
+  .filter(Boolean);
+
+// Admin verification
+const verifyAdmin = (req, res, next) => {
+  const secret = req.headers["x-internal-secret"];
+  const userId = req.headers["x-user-id"];
+
+  if (
+    !process.env.INTERNAL_API_SECRET ||
+    secret !== process.env.INTERNAL_API_SECRET
+  ) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized request",
+    });
+  }
+
+  if (!adminUserIds.includes(String(userId || ""))) {
+    return res.status(403).json({
+      success: false,
+      message: "Admin access required",
+    });
+  }
+
+  next();
+};
+
+// MongoDB ID helper
+const getIdFilter = (id) => {
+  if (ObjectId.isValid(id)) {
+    return {
+      $or: [{ _id: new ObjectId(id) }, { _id: id }, { id: id }],
+    };
+  }
+
+  return {
+    $or: [{ _id: id }, { id: id }],
+  };
+};
+
+// Safe public user data
+const safeUser = (user) => {
+  if (!user) return null;
+
+  const { password, ...rest } = user;
+
+  return {
+    ...rest,
+    id: String(user._id || user.id),
+  };
+};
+
+// Escape search input
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// =========================================
+app.get("/admin/users", verifyAdmin, async (req, res) => {
   try {
-    const vendorId = req.headers["x-user-id"];
-    const { id } = req.params;
+    const { search = "", role = "", page = 1, limit = 10 } = req.query;
 
-    if (!vendorId) {
-      return res.status(401).json({
+    const currentPage = Math.max(1, Number(page) || 1);
+
+    const pageLimit = Math.min(50, Math.max(1, Number(limit) || 10));
+
+    const filter = {};
+
+    if (role) {
+      filter.role = role;
+    }
+
+    if (search.trim()) {
+      const regex = new RegExp(escapeRegex(search.trim()), "i");
+
+      filter.$or = [{ name: regex }, { email: regex }];
+    }
+
+    const [users, total] = await Promise.all([
+      userCollection
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .skip((currentPage - 1) * pageLimit)
+        .limit(pageLimit)
+        .toArray(),
+
+      userCollection.countDocuments(filter),
+    ]);
+
+    const data = users.map((user) => ({
+      ...safeUser(user),
+      isAdmin: adminUserIds.includes(String(user._id || user.id)),
+    }));
+
+    res.json({
+      success: true,
+
+      data: {
+        users: data,
+        total,
+        page: currentPage,
+        limit: pageLimit,
+        totalPages: Math.ceil(total / pageLimit),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch users",
+    });
+  }
+});
+
+// =================================================
+app.get("/admin/users/:id", verifyAdmin, async (req, res) => {
+  try {
+    const user = await userCollection.findOne(getIdFilter(req.params.id));
+
+    if (!user) {
+      return res.status(404).json({
         success: false,
-        message: "Vendor authentication required",
+        message: "User not found",
       });
     }
 
-    // Validate MongoDB ObjectId
-    if (!ObjectId.isValid(id)) {
+    res.json({
+      success: true,
+      data: {
+        ...safeUser(user),
+        isAdmin: adminUserIds.includes(String(user._id || user.id)),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch user details",
+    });
+  }
+});
+
+// ================================================
+app.patch("/admin/users/:id/block", verifyAdmin, async (req, res) => {
+  try {
+    const user = await userCollection.findOne(getIdFilter(req.params.id));
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    const targetId = String(user._id || user.id);
+
+    if (adminUserIds.includes(targetId)) {
+      return res.status(403).json({
+        success: false,
+        message: "Admin accounts cannot be blocked here",
+      });
+    }
+
+    await userCollection.updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          banned: true,
+          banReason: "Blocked by administrator",
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    // Revoke existing sessions
+    await db.collection("session").deleteMany({
+      userId: targetId,
+    });
+
+    res.json({
+      success: true,
+      message: "User blocked successfully",
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to block user",
+    });
+  }
+});
+// ================================================
+app.patch("/admin/users/:id/unblock", verifyAdmin, async (req, res) => {
+  try {
+    const user = await userCollection.findOne(getIdFilter(req.params.id));
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    if (adminUserIds.includes(String(user._id || user.id))) {
+      return res.status(403).json({
+        success: false,
+        message: "Invalid operation",
+      });
+    }
+
+    await userCollection.updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          banned: false,
+          updatedAt: new Date(),
+        },
+        $unset: {
+          banReason: "",
+          banExpires: "",
+        },
+      },
+    );
+
+    res.json({
+      success: true,
+      message: "User unblocked successfully",
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to unblock user",
+    });
+  }
+});
+// ===============================================
+app.get("/admin/services", verifyAdmin, async (req, res) => {
+  try {
+    const { search = "", status = "" } = req.query;
+
+    const filter = {};
+
+    if (status) {
+      filter.$or = [
+        { approvalStatus: status },
+        {
+          approvalStatus: { $exists: false },
+          status,
+        },
+      ];
+    }
+
+    if (search.trim()) {
+      const regex = new RegExp(escapeRegex(search.trim()), "i");
+
+      const searchFilter = {
+        $or: [
+          { serviceName: regex },
+          { title: regex },
+          { category: regex },
+          { location: regex },
+        ],
+      };
+
+      if (filter.$or) {
+        filter.$and = [{ $or: filter.$or }, searchFilter];
+
+        delete filter.$or;
+      } else {
+        Object.assign(filter, searchFilter);
+      }
+    }
+
+    const services = await servicesCollection
+      .find(filter)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const data = await Promise.all(
+      services.map(async (service) => {
+        const vendor = service.vendorId
+          ? await userCollection.findOne(getIdFilter(String(service.vendorId)))
+          : null;
+
+        return {
+          ...service,
+          id: String(service._id),
+          vendorName: vendor?.name || "Unknown Vendor",
+          vendorEmail: vendor?.email || "",
+          approvalStatus: service.approvalStatus || service.status || "pending",
+        };
+      }),
+    );
+
+    res.json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    console.error("Admin Services:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch services",
+    });
+  }
+});
+// =============================================
+app.patch("/admin/services/:id/approve", verifyAdmin, async (req, res) => {
+  try {
+    const result = await servicesCollection.updateOne(
+      getIdFilter(req.params.id),
+      {
+        $set: {
+          approvalStatus: "approved",
+          status: "approved",
+          isActive: true,
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    if (!result.matchedCount) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Service approved successfully",
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to approve service",
+    });
+  }
+});
+// ==============================================app.patch(
+app.patch("/admin/services/:id/reject", verifyAdmin, async (req, res) => {
+  try {
+    const result = await servicesCollection.updateOne(
+      getIdFilter(req.params.id),
+      {
+        $set: {
+          approvalStatus: "rejected",
+          status: "rejected",
+          isActive: false,
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    if (!result.matchedCount) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Service rejected successfully",
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to reject service",
+    });
+  }
+});
+// ===============================================
+app.patch("/admin/services/:id/status", verifyAdmin, async (req, res) => {
+  try {
+    const { isActive } = req.body;
+
+    if (typeof isActive !== "boolean") {
       return res.status(400).json({
         success: false,
-        message: "Invalid service ID",
+        message: "isActive must be true or false",
       });
     }
 
-    // Find service belonging to this vendor
-    const service = await servicesCollection.findOne({
-      _id: new ObjectId(id),
-      vendorId: vendorId,
-    });
+    const service = await servicesCollection.findOne(
+      getIdFilter(req.params.id),
+    );
 
     if (!service) {
       return res.status(404).json({
@@ -540,23 +912,130 @@ app.get("/vendor/services/:id", verifyInternalRequest, async (req, res) => {
       });
     }
 
-    return res.status(200).json({
+    const approval = service.approvalStatus || service.status;
+
+    if (approval !== "approved") {
+      return res.status(400).json({
+        success: false,
+        message: "Only approved services can be activated",
+      });
+    }
+
+    await servicesCollection.updateOne(
+      { _id: service._id },
+      {
+        $set: {
+          isActive,
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    res.json({
       success: true,
-      service,
+      message: isActive
+        ? "Service activated successfully"
+        : "Service deactivated successfully",
     });
   } catch (error) {
-    console.error("GET SINGLE SERVICE ERROR:", error);
-
-    return res.status(500).json({
+    res.status(500).json({
       success: false,
-      message: "Failed to fetch service details",
-      error: error.message,
+      message: "Failed to change service status",
     });
   }
 });
-// !! end ==============================================
-// end single card details
-// !====================================================
+// ===============================================
+app.delete("/admin/services/:id", verifyAdmin, async (req, res) => {
+  try {
+    const result = await servicesCollection.deleteOne(
+      getIdFilter(req.params.id),
+    );
+
+    if (!result.deletedCount) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Service deleted successfully",
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete service",
+    });
+  }
+});
+
+// ==============================================
+// ! transection
+// ==============================================
+app.get("/admin/transactions", verifyAdmin, async (req, res) => {
+  try {
+    const { search = "" } = req.query;
+
+    const transactions = await transactionsCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const data = await Promise.all(
+      transactions.map(async (transaction) => {
+        const vendor = transaction.vendorId
+          ? await userCollection.findOne(
+              getIdFilter(String(transaction.vendorId)),
+            )
+          : null;
+
+        return {
+          ...transaction,
+          id: String(transaction._id),
+
+          vendorName: vendor?.name || "Unknown Vendor",
+          vendorEmail: vendor?.email || "",
+
+          plan: transaction.plan || "N/A",
+          amount: transaction.amount || 0,
+          currency: transaction.currency || "BDT",
+          status: transaction.status || "pending",
+        };
+      }),
+    );
+
+    const keyword = search.trim().toLowerCase();
+
+    const filtered = keyword
+      ? data.filter((item) =>
+          [
+            item.vendorName,
+            item.vendorEmail,
+            item.stripeSessionId,
+            item.stripeSubscriptionId,
+            item.plan,
+          ].some((value) =>
+            String(value || "")
+              .toLowerCase()
+              .includes(keyword),
+          ),
+        )
+      : data;
+
+    res.json({
+      success: true,
+      data: filtered,
+    });
+  } catch (error) {
+    console.error("Admin Transactions:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch transactions",
+    });
+  }
+});
 
 // =============================================
 // 9. HOME ROUTE
