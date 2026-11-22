@@ -1702,38 +1702,83 @@ app.post("/bookings", verifyInternalRequest, async (req, res) => {
 //  geting booking
 // =============================================
 
-app.get("/my-bookings", verifyInternalRequest, async (req, res) => {
-  try {
-    const userId = req.headers["x-user-id"];
-    const userRole = req.headers["x-user-role"];
+// ==============================================
+// GET VENDOR BOOKINGS
+// ==============================================
 
-    if (userRole !== "user") {
+app.get("/vendor/bookings", verifyInternalRequest, async (req, res) => {
+  try {
+    const vendorId = req.headers["x-user-id"];
+    const vendorRole = req.headers["x-user-role"];
+
+    if (!vendorId || vendorRole !== "vendor") {
       return res.status(403).json({
         success: false,
-        message: "Only users can access their bookings",
+        message: "Vendor access denied",
       });
     }
 
+    // ১. URL থেকে status গ্রহণ
+    const { status = "all" } = req.query;
+
+    // ২. Allowed status যাচাই
+    const allowedStatuses = ["all", "pending", "accepted", "rejected"];
+
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid status",
+      });
+    }
+
+    // ৩. Vendor অনুযায়ী query তৈরি
+    const query = { vendorId };
+
+    // ৪. All ছাড়া অন্য filter হলে status যোগ
+    if (status !== "all") {
+      query.status = status;
+    }
+
+    // ৫. Filter অনুযায়ী booking বের করা
     const bookings = await bookingsCollection
-      .find({ userId })
+      .find(query)
       .sort({ createdAt: -1 })
       .toArray();
 
-    res.status(200).json({
+    // ৬. সব status-এর count বের করা
+    const [pending, accepted, rejected] = await Promise.all([
+      bookingsCollection.countDocuments({
+        vendorId,
+        status: "pending",
+      }),
+      bookingsCollection.countDocuments({
+        vendorId,
+        status: "accepted",
+      }),
+      bookingsCollection.countDocuments({
+        vendorId,
+        status: "rejected",
+      }),
+    ]);
+
+    return res.status(200).json({
       success: true,
-      totalBookings: bookings.length,
       bookings,
+      counts: {
+        pending,
+        accepted,
+        rejected,
+      },
     });
   } catch (error) {
-    console.error("My Bookings Error:", error);
+    console.error("Vendor Bookings Error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: "Failed to fetch bookings",
     });
   }
 });
-
 // ==============================================
 // booking id
 // ==============================================
@@ -1856,6 +1901,133 @@ app.patch("/bookings/:id/reject", verifyInternalRequest, async (req, res) => {
 // book service route
 // ==========================================
 
+// ==========================================
+// my-bookings
+// =========================================
+
+app.get("/my-bookings", verifyInternalRequest, async (req, res) => {
+  try {
+    const userId = req.headers["x-user-id"];
+    const userRole = req.headers["x-user-role"];
+
+    // Authentication check
+    if (!userId || userRole !== "user") {
+      return res.status(403).json({
+        success: false,
+        message: "Only authenticated users can access their bookings",
+      });
+    }
+
+    // Fetch bookings belonging to this user
+    const bookings = await bookingsCollection
+      .find({ userId })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      totalBookings: bookings.length,
+      bookings,
+    });
+  } catch (error) {
+    console.error("My Bookings Backend Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch bookings",
+    });
+  }
+});
+
+// ============================================
+// user dashboard
+// =============================================
+
+app.get("/user/dashboard", verifyInternalRequest, async (req, res) => {
+  try {
+    const userId = req.headers["x-user-id"];
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "User authentication required",
+      });
+    }
+
+    const bookingsCollection = db.collection("bookings");
+    const favoritesCollection = db.collection("favorites");
+
+    // Get all bookings of logged-in user
+    const bookings = await bookingsCollection
+      .find({ userId })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    // Booking statistics
+    const totalBookings = bookings.length;
+
+    const pendingBookings = bookings.filter(
+      (booking) => booking.status === "pending",
+    ).length;
+
+    const confirmedBookings = bookings.filter(
+      (booking) => booking.status === "accepted",
+    ).length;
+
+    const rejectedBookings = bookings.filter(
+      (booking) => booking.status === "rejected",
+    ).length;
+
+    const cancelledBookings = bookings.filter(
+      (booking) => booking.status === "cancelled",
+    ).length;
+
+    // Favorite vendors count
+    const totalFavorites = await favoritesCollection.countDocuments({
+      userId,
+    });
+
+    // Recent bookings
+    const recentBookings = bookings.slice(0, 5);
+
+    // Upcoming accepted events
+    const now = new Date();
+
+    const upcomingEvent =
+      bookings
+        .filter((booking) => {
+          return (
+            booking.status === "accepted" && new Date(booking.eventDate) >= now
+          );
+        })
+        .sort((a, b) => new Date(a.eventDate) - new Date(b.eventDate))[0] ||
+      null;
+
+    return res.status(200).json({
+      success: true,
+
+      stats: {
+        totalBookings,
+        pendingBookings,
+        confirmedBookings,
+        rejectedBookings,
+        cancelledBookings,
+        totalFavorites,
+      },
+
+      recentBookings,
+      upcomingEvent,
+    });
+  } catch (error) {
+    console.error("User dashboard error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load dashboard data",
+    });
+  }
+});
+
 // ============================================
 // Home services card
 // ============================================
@@ -1933,6 +2105,101 @@ app.get("/services/:id", verifyInternalRequest, async (req, res) => {
     });
   }
 });
+
+// ============================================
+
+// ============================================
+// VENDOR TRANSACTION HISTORY
+// ============================================
+
+app.get(
+  "/api/vendor/dashboard/subscription",
+  verifyInternalRequest,
+  async (req, res) => {
+    try {
+      const vendorId = req.headers["x-user-id"];
+
+      if (!vendorId) {
+        return res.status(401).json({
+          success: false,
+          message: "Vendor authentication required",
+        });
+      }
+
+      const limit = Math.min(Math.max(Number(req.query.limit) || 3, 1), 10);
+
+      // 1. Get vendor information from usersCollection
+      const user = await usersCollection.findOne(
+        { _id: new ObjectId(vendorId) },
+        {
+          projection: {
+            password: 0,
+          },
+        },
+      );
+
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "Vendor not found",
+        });
+      }
+
+      // 2. Get latest successful payment to determine current plan
+      const latestPayment = await transactionsCollection.findOne(
+        {
+          vendorId,
+          status: "paid",
+        },
+        {
+          sort: {
+            paidAt: -1,
+            createdAt: -1,
+          },
+        },
+      );
+
+      // 3. Get premium payment history
+      const transactions = await transactionsCollection
+        .find({
+          vendorId,
+          plan: "premium",
+          status: "paid",
+        })
+        .sort({
+          paidAt: -1,
+          createdAt: -1,
+        })
+        .limit(limit)
+        .project({
+          vendorId: 0,
+          vendorEmail: 0,
+        })
+        .toArray();
+
+      // 4. Prepare subscription information
+      const subscription = {
+        plan: latestPayment?.plan?.toLowerCase() || "free",
+        status: user.subscriptionStatus || "inactive",
+        expiryDate: user.subscriptionExpiry || null,
+      };
+
+      return res.status(200).json({
+        success: true,
+        subscription,
+        totalTransactions: transactions.length,
+        transactions,
+      });
+    } catch (error) {
+      console.error("Vendor Subscription Error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to load subscription",
+      });
+    }
+  },
+);
 
 // =============================================
 // 9. HOME ROUTE
