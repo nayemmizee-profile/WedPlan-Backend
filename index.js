@@ -6,6 +6,10 @@ import multer from "multer";
 
 import Stripe from "stripe";
 
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error("STRIPE_SECRET_KEY is missing");
+}
+
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 // =============================================
 // 1. INITIAL SETUP
@@ -19,7 +23,15 @@ const port = process.env.PORT || 8000;
 // =============================================
 
 // JSON Request গ্রহণ করার জন্য
-app.use(express.json());
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      if (req.originalUrl === "/stripe/webhook") {
+        req.rawBody = Buffer.from(buf);
+      }
+    },
+  }),
+);
 
 // Frontend থেকে Request গ্রহণ করার জন্য
 app.use(cors());
@@ -174,24 +186,15 @@ const uploadToImgBB = async (file) => {
 // 8. ADD NEW SERVICE API
 // =============================================
 
-
 app.post(
   "/services",
-
-  // =========================================
-  // STEP 1: VERIFY INTERNAL REQUEST
-  // =========================================
   verifyInternalRequest,
-
-  // =========================================
-  // STEP 2: IMAGE UPLOAD (MAX 5)
-  // =========================================
   upload.array("images", 5),
 
   async (req, res) => {
     try {
       // =========================================
-      // STEP 3: GET VENDOR INFORMATION
+      // STEP 1: GET VENDOR INFORMATION
       // =========================================
 
       const vendorEmail = req.headers["x-user-email"];
@@ -205,7 +208,7 @@ app.post(
       }
 
       // =========================================
-      // STEP 4: FIND VENDOR
+      // STEP 2: FIND VENDOR FROM DATABASE
       // =========================================
 
       const vendor = await usersCollection.findOne({
@@ -220,7 +223,7 @@ app.post(
       }
 
       // =========================================
-      // STEP 5: VERIFY VENDOR ID
+      // STEP 3: VERIFY VENDOR ID
       // =========================================
 
       if (vendor._id.toString() !== userId) {
@@ -236,7 +239,7 @@ app.post(
       console.log("Received Vendor Email:", vendorEmail);
 
       // =========================================
-      // STEP 6: VERIFY VENDOR ROLE
+      // STEP 4: CHECK VENDOR ROLE
       // =========================================
 
       if (vendor.role !== "vendor") {
@@ -247,10 +250,11 @@ app.post(
       }
 
       // =========================================
-      // STEP 7: CHECK BLOCKED STATUS
+      // STEP 5: CHECK BLOCK STATUS
       // =========================================
 
-      if (vendor.isBlocked === true) {
+      // Admin Block API uses banned field.
+      if (vendor.banned === true) {
         return res.status(403).json({
           success: false,
           message: "Your account has been blocked",
@@ -258,28 +262,23 @@ app.post(
       }
 
       // =========================================
-      // STEP 8: CHECK LIFETIME PREMIUM STATUS
+      // STEP 6: CHECK PREMIUM STATUS
       // =========================================
-
-      // One-time $199 payment করলে
-      // Vendor Lifetime Premium পাবে।
 
       const isPremium =
         vendor.subscriptionPlan === "premium" &&
         vendor.subscriptionStatus === "active";
 
       // =========================================
-      // STEP 9: FREE PLAN SERVICE LIMIT
+      // STEP 7: FREE VENDOR SERVICE LIMIT
       // =========================================
-
-      // Free Vendor সর্বোচ্চ ৩টি Service Add করতে পারবে।
-      // Premium Vendor-এর কোনো Service Limit থাকবে না।
 
       if (!isPremium) {
         const totalServices = await servicesCollection.countDocuments({
           vendorId: vendorId,
         });
 
+        // Free vendor can add maximum 3 services.
         if (totalServices >= 3) {
           return res.status(403).json({
             success: false,
@@ -295,35 +294,25 @@ app.post(
       }
 
       // =========================================
-      // STEP 10: GET FORM DATA
+      // STEP 8: GET SERVICE FORM DATA
       // =========================================
 
-      const {
-        serviceName,
-        category,
-        description,
-        price,
-        location,
-      } = req.body;
+      const { serviceName, category, description, price, location } = req.body;
 
       // =========================================
-      // STEP 11: VALIDATE FORM DATA
+      // STEP 9: VALIDATE REQUIRED FIELDS
       // =========================================
 
       if (
         typeof serviceName !== "string" ||
         !serviceName.trim() ||
-
         typeof category !== "string" ||
         !category.trim() ||
-
         typeof description !== "string" ||
         !description.trim() ||
-
         price === undefined ||
         price === null ||
         price === "" ||
-
         typeof location !== "string" ||
         !location.trim()
       ) {
@@ -334,15 +323,12 @@ app.post(
       }
 
       // =========================================
-      // STEP 12: VALIDATE PRICE
+      // STEP 10: VALIDATE SERVICE PRICE
       // =========================================
 
       const servicePrice = Number(price);
 
-      if (
-        !Number.isFinite(servicePrice) ||
-        servicePrice <= 0
-      ) {
+      if (!Number.isFinite(servicePrice) || servicePrice <= 0) {
         return res.status(400).json({
           success: false,
           message: "Please provide a valid price",
@@ -350,7 +336,7 @@ app.post(
       }
 
       // =========================================
-      // STEP 13: GET UPLOADED IMAGES
+      // STEP 11: CHECK UPLOADED IMAGES
       // =========================================
 
       const images = req.files || [];
@@ -363,116 +349,33 @@ app.post(
       }
 
       // =========================================
-      // STEP 14: PREPARE SERVICE DATA
+      // STEP 12: UPLOAD IMAGES TO IMGBB
       // =========================================
 
-      // তোমার আগের Cloudinary/Image Upload Logic
-      // থাকলে এখানেই সেটি ব্যবহার করবে।
+      // Multer memoryStorage provides file.buffer.
+      // uploadToImgBB must accept the Multer file object.
 
-      // নিচের উদাহরণটি ধরে নিচ্ছে যে upload
-      // middleware req.files-এ image URL রাখছে।
-      // Cloudinary ব্যবহার করলে secure_url mapping করবে।
+      const imageUrls = await Promise.all(
+        images.map((file) => uploadToImgBB(file)),
+      );
 
-      const imageUrls = images.map((image) => {
-        return image.path || image.secure_url;
-      }).filter(Boolean);
+      console.log("Images uploaded successfully:", imageUrls.length);
 
-      if (imageUrls.length !== images.length) {
-        return res.status(400).json({
+      // Verify all image uploads were successful.
+      if (
+        imageUrls.length !== images.length ||
+        imageUrls.some((url) => typeof url !== "string" || !url)
+      ) {
+        return res.status(500).json({
           success: false,
           message: "Image upload failed",
         });
       }
 
       // =========================================
-      // STEP 15: CREATE SERVICE OBJECT
+      // STEP 13: CREATE NEW SERVICE DOCUMENT
       // =========================================
 
-      const newService = {
-        vendorId: vendorId,
-
-        vendorName: vendor.name,
-        vendorEmail: vendor.email,
-
-        serviceName: serviceName.trim(),
-        category: category.trim(),
-        description: description.trim(),
-
-        price: servicePrice,
-        location: location.trim(),
-
-        images: imageUrls,
-
-        approvalStatus: "pending",
-
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      // =========================================
-      // STEP 16: INSERT SERVICE
-      // =========================================
-
-      const result = await servicesCollection.insertOne(
-        newService
-      );
-
-      // =========================================
-      // STEP 17: SUCCESS RESPONSE
-      // =========================================
-
-      return res.status(201).json({
-        success: true,
-        message: "Service added successfully",
-
-        serviceId: result.insertedId,
-
-        isPremium,
-        totalImages: imageUrls.length,
-
-        service: newService,
-      });
-
-    } catch (error) {
-      console.error("Add Service Error:", error);
-
-      return res.status(500).json({
-        success: false,
-        message: "Failed to add service",
-      });
-    }
-  }
-);
-
-
-      // -----------------------------------------
-      // STEP 10: VALIDATE IMAGES
-      // -----------------------------------------
-
-      // অন্তত একটি Image Upload করতে হবে
-      if (!req.files || req.files.length === 0) {
-        return res.status(400).json({
-          success: false,
-          message: "At least one image is required",
-        });
-      }
-
-      // -----------------------------------------
-      // STEP 11: UPLOAD IMAGES TO IMGBB
-      // -----------------------------------------
-
-      // সকল Image ImgBB-তে Upload
-      const imageUrls = await Promise.all(
-        req.files.map((file) => uploadToImgBB(file)),
-      );
-
-      console.log("Images uploaded successfully:", imageUrls.length);
-
-      // -----------------------------------------
-      // STEP 12: CREATE SERVICE DOCUMENT
-      // -----------------------------------------
-
-      // MongoDB-তে Save করার জন্য Service Object
       const newService = {
         // Vendor Information
         vendorId: vendorId,
@@ -486,26 +389,26 @@ app.post(
         price: servicePrice,
         location: location.trim(),
 
-        // Uploaded Image URLs
+        // Uploaded ImgBB Image URLs
         images: imageUrls,
 
-        // Admin Approval-এর জন্য Default Status
-        status: "pending",
+        // Admin Approval
+        approvalStatus: "pending",
 
-        // Creation এবং Update Date
+        // Creation and Update Date
         createdAt: new Date(),
         updatedAt: new Date(),
       };
 
-      // -----------------------------------------
-      // STEP 13: INSERT INTO MONGODB
-      // -----------------------------------------
+      // =========================================
+      // STEP 14: SAVE SERVICE TO MONGODB
+      // =========================================
 
       const result = await servicesCollection.insertOne(newService);
 
-      // -----------------------------------------
-      // STEP 14: SEND SUCCESS RESPONSE
-      // -----------------------------------------
+      // =========================================
+      // STEP 15: SEND SUCCESS RESPONSE
+      // =========================================
 
       return res.status(201).json({
         success: true,
@@ -513,15 +416,18 @@ app.post(
 
         serviceId: result.insertedId,
 
+        isPremium,
+        totalImages: imageUrls.length,
+
         service: {
           ...newService,
           _id: result.insertedId,
         },
       });
     } catch (error) {
-      // -----------------------------------------
+      // =========================================
       // ERROR HANDLING
-      // -----------------------------------------
+      // =========================================
 
       console.error("ADD SERVICE ERROR:", error);
 
@@ -1240,9 +1146,8 @@ app.get("/admin/overview", verifyAdmin, async (req, res) => {
    END ADMIN ROUTES
 ================================================= */
 
-
 // ?===============================================
-// STRIPE checkout 
+// STRIPE checkout
 // ?===============================================
 // Create Stripe Checkout Session
 app.post("/payments/create-checkout-session", async (req, res) => {
@@ -1280,7 +1185,7 @@ app.post("/payments/create-checkout-session", async (req, res) => {
       });
     }
 
-    if (vendor.isBlocked) {
+    if (vendor.banned === true) {
       return res.status(403).json({
         success: false,
         message: "Your account is blocked",
@@ -1288,7 +1193,10 @@ app.post("/payments/create-checkout-session", async (req, res) => {
     }
 
     // 3. Check existing premium status
-    if (vendor.subscriptionPlan === "premium") {
+    if (
+      vendor.subscriptionPlan === "premium" &&
+      vendor.subscriptionStatus === "active"
+    ) {
       return res.status(400).json({
         success: false,
         message: "You already have Premium access",
@@ -1329,8 +1237,7 @@ app.post("/payments/create-checkout-session", async (req, res) => {
 
             product_data: {
               name: "Wedding Plan Premium Membership",
-              description:
-                "Unlimited additional service listings",
+              description: "Unlimited additional service listings",
             },
 
             unit_amount: 19900,
@@ -1340,11 +1247,9 @@ app.post("/payments/create-checkout-session", async (req, res) => {
         },
       ],
 
-      success_url:
-        `${process.env.CLIENT_URL}/vendor/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      success_url: `${process.env.CLIENT_URL}/vendor/payment/success?session_id={CHECKOUT_SESSION_ID}`,
 
-      cancel_url:
-        `${process.env.CLIENT_URL}/vendor/upgrade`,
+      cancel_url: `${process.env.CLIENT_URL}/vendor/upgrade`,
     });
 
     // 6. Save pending transaction
@@ -1363,14 +1268,13 @@ app.post("/payments/create-checkout-session", async (req, res) => {
           createdAt: new Date(),
         },
       },
-      { upsert: true }
+      { upsert: true },
     );
 
     return res.status(200).json({
       success: true,
       url: checkoutSession.url,
     });
-
   } catch (error) {
     console.error("Stripe Checkout Error:", error);
 
@@ -1381,14 +1285,12 @@ app.post("/payments/create-checkout-session", async (req, res) => {
   }
 });
 
-
 // ?=====================================================
 // ?=====================================================
-
 
 app.post(
   "/stripe/webhook",
-  express.raw({ type: "application/json" }),
+
   async (req, res) => {
     const signature = req.headers["stripe-signature"];
 
@@ -1397,16 +1299,14 @@ app.post(
     // 1. Verify Stripe signature
     try {
       event = stripe.webhooks.constructEvent(
-        req.body,
+        req.rawBody,
         signature,
-        process.env.STRIPE_WEBHOOK_SECRET
+        process.env.STRIPE_WEBHOOK_SECRET,
       );
     } catch (error) {
       console.error("Webhook Signature Error:", error.message);
 
-      return res.status(400).send(
-        `Webhook Error: ${error.message}`
-      );
+      return res.status(400).send(`Webhook Error: ${error.message}`);
     }
 
     try {
@@ -1427,40 +1327,74 @@ app.post(
         ) {
           return res.status(400).send("Invalid payment");
         }
+        // 4. Verify transaction in MongoDB
+        // =================================================================================
+        const transaction = await transactionsCollection.findOne({
+          stripeSessionId: checkoutSession.id,
+          vendorId: userId,
+          plan: "premium",
+          amount: 199,
+          currency: "usd",
+        });
+
+        if (!transaction) {
+          return res.status(400).send("Transaction not found");
+        }
+
+        // 5. Prevent duplicate payment processing
+        if (transaction.status === "paid") {
+          return res.status(200).json({
+            received: true,
+            message: "Payment already processed",
+          });
+        }
+
+        if (transaction.status !== "pending") {
+          return res.status(400).send("Invalid transaction status");
+        }
 
         // 4. Activate Premium
-        await usersCollection.updateOne(
+        // 6. Activate Premium
+        const updateResult = await usersCollection.updateOne(
           {
             _id: new ObjectId(userId),
             role: "vendor",
-            isBlocked: { $ne: true },
+            banned: { $ne: true },
           },
           {
             $set: {
               subscriptionPlan: "premium",
               subscriptionStatus: "active",
               premiumActivatedAt: new Date(),
-              stripeCustomerId:
-                checkoutSession.customer || null,
+              stripeCustomerId: checkoutSession.customer || null,
             },
-          }
+          },
         );
 
+        if (updateResult.matchedCount !== 1) {
+          throw new Error("Vendor not found or account blocked");
+        }
+
         // 5. Update transaction
-        await transactionsCollection.updateOne(
+        // 7. Update transaction
+        const transactionUpdate = await transactionsCollection.updateOne(
           {
             stripeSessionId: checkoutSession.id,
+            vendorId: userId,
+            status: "pending",
           },
           {
             $set: {
               status: "paid",
-              stripePaymentIntent:
-                checkoutSession.payment_intent,
+              stripePaymentIntent: checkoutSession.payment_intent,
               paidAt: new Date(),
             },
           },
-          { upsert: true }
         );
+
+        if (transactionUpdate.modifiedCount !== 1) {
+          throw new Error("Transaction update failed");
+        }
 
         console.log("Premium activated:", userId);
       }
@@ -1468,7 +1402,6 @@ app.post(
       return res.status(200).json({
         received: true,
       });
-
     } catch (error) {
       console.error("Webhook Processing Error:", error);
 
@@ -1476,14 +1409,12 @@ app.post(
         received: false,
       });
     }
-  }
+  },
 );
 
 // IMPORTANT: Keep this AFTER the webhook route.
 app.use(express.json());
 // ?=====================================================
-
-
 
 // =============================================
 // 9. HOME ROUTE
