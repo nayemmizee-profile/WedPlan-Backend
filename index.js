@@ -1020,127 +1020,214 @@ app.delete("/admin/services/:id", verifyAdmin, async (req, res) => {
 
 app.get("/admin/overview", verifyAdmin, async (req, res) => {
   try {
-    // 1. Total Users
+    // Registered users
     const totalUsers = await usersCollection.countDocuments();
 
-    // 2. Total Services
+    // Vendors
+    const totalVendors = await usersCollection.countDocuments({
+      role: "vendor",
+    });
+
+    // Customers
+    const totalCustomers = await usersCollection.countDocuments({
+      role: "user",
+    });
+
+    // Services
     const totalServices = await servicesCollection.countDocuments();
 
-    // 3. Total Bookings
-    const totalBookings = await bookingsCollection.countDocuments();
+    // Pending services
+    const pendingServices = await servicesCollection.countDocuments({
+      approvalStatus: "pending",
+    });
 
-    // 4. Total Transactions
+    // Total transactions (all statuses)
     const totalTransactions = await transactionsCollection.countDocuments();
 
-    const totalVendors = await usersCollection.countDocuments({
-      $or: [{ role: "vendor" }, { accountType: "vendor" }],
-    });
-
-    const totalCustomers = await usersCollection.countDocuments({
-      $or: [{ role: "user" }, { accountType: "user" }],
-    });
-
-    // 5. Service Statistics
-    const serviceStats = await servicesCollection
+    // Total successfully received payment amount
+    const transactionStats = await transactionsCollection
       .aggregate([
         {
-          $addFields: {
-            finalStatus: {
-              $ifNull: ["$approvalStatus", { $ifNull: ["$status", "pending"] }],
-            },
+          $match: {
+            status: "paid",
+            currency: "usd",
           },
         },
         {
           $group: {
             _id: null,
-
-            pendingServices: {
-              $sum: {
-                $cond: [{ $eq: ["$finalStatus", "pending"] }, 1, 0],
-              },
-            },
-
-            approvedServices: {
-              $sum: {
-                $cond: [{ $eq: ["$finalStatus", "approved"] }, 1, 0],
-              },
-            },
-
-            rejectedServices: {
-              $sum: {
-                $cond: [{ $eq: ["$finalStatus", "rejected"] }, 1, 0],
-              },
-            },
-
-            activeServices: {
-              $sum: {
-                $cond: [{ $eq: ["$isActive", true] }, 1, 0],
-              },
-            },
-
-            inactiveServices: {
-              $sum: {
-                $cond: [{ $eq: ["$isActive", false] }, 1, 0],
-              },
+            totalAmount: {
+              $sum: "$amount",
             },
           },
         },
       ])
       .toArray();
 
-    // 6. Default Statistics
-    const stats = serviceStats[0] || {
-      pendingServices: 0,
-      approvedServices: 0,
-      rejectedServices: 0,
-      activeServices: 0,
-      inactiveServices: 0,
-    };
+    const totalTransactionAmount = transactionStats[0]?.totalAmount || 0;
 
-    // 7. Recent Services
-    const recentServices = await servicesCollection
-      .find({})
-      .sort({ createdAt: -1 })
-      .limit(5)
-      .toArray();
-
-    // 8. Dashboard Response
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
-      message: "Admin dashboard data fetched successfully",
-
       overview: {
         totalUsers,
         totalVendors,
         totalCustomers,
-
         totalServices,
-        totalBookings,
+        pendingServices,
         totalTransactions,
-
-        pendingServices: stats.pendingServices,
-        approvedServices: stats.approvedServices,
-        rejectedServices: stats.rejectedServices,
-        activeServices: stats.activeServices,
-        inactiveServices: stats.inactiveServices,
+        totalTransactionAmount,
       },
-
-      recentServices: recentServices.map((service) => ({
-        ...service,
-        id: String(service._id),
-        approvalStatus: service.approvalStatus || service.status || "pending",
-      })),
     });
   } catch (error) {
-    console.error("ADMIN OVERVIEW ERROR:", error);
+    console.error("Admin Overview Error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      message: "Failed to fetch admin overview",
-      error: error.message,
+      message: "Failed to load admin overview",
     });
   }
 });
+
+// =====================================================
+// Admin Transactions
+// =====================================================
+
+app.get("/admin/transactions", verifyAdmin, async (req, res) => {
+  try {
+    const { search = "", status = "", plan = "" } = req.query;
+
+    const pipeline = [
+      {
+        $lookup: {
+          from: "user",
+          let: { vendorId: "$vendorId" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $eq: [{ $toString: "$_id" }, "$$vendorId"],
+                },
+              },
+            },
+            {
+              $project: {
+                name: 1,
+                email: 1,
+                image: 1,
+                role: 1,
+                subscriptionPlan: 1,
+                subscriptionStatus: 1,
+              },
+            },
+          ],
+          as: "vendor",
+        },
+      },
+      {
+        $unwind: {
+          path: "$vendor",
+          preserveNullAndEmptyArrays: true,
+        },
+      },
+    ];
+
+    // Search Filter
+    if (search.trim()) {
+      const regex = new RegExp(
+        search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        "i",
+      );
+
+      pipeline.push({
+        $match: {
+          $or: [
+            { vendorEmail: regex },
+            { vendorId: regex },
+            { stripeSessionId: regex },
+            { stripePaymentIntent: regex },
+            { plan: regex },
+            { status: regex },
+            { "vendor.name": regex },
+            { "vendor.email": regex },
+          ],
+        },
+      });
+    }
+
+    // Status Filter
+    if (status) {
+      pipeline.push({
+        $match: { status },
+      });
+    }
+
+    // Plan Filter
+    if (plan) {
+      pipeline.push({
+        $match: { plan },
+      });
+    }
+
+    // Latest transactions first
+    pipeline.push({
+      $sort: { createdAt: -1 },
+    });
+
+    const transactions = await transactionsCollection
+      .aggregate(pipeline)
+      .toArray();
+
+    const formattedTransactions = transactions.map((transaction) => ({
+      id: transaction._id.toString(),
+
+      vendorId: transaction.vendorId,
+
+      vendorName: transaction.vendor?.name || "Unknown Vendor",
+
+      vendorEmail:
+        transaction.vendor?.email || transaction.vendorEmail || "Unknown Email",
+
+      vendorImage: transaction.vendor?.image || null,
+
+      vendorRole: transaction.vendor?.role || null,
+
+      subscriptionPlan: transaction.vendor?.subscriptionPlan || null,
+
+      subscriptionStatus: transaction.vendor?.subscriptionStatus || null,
+
+      plan: transaction.plan,
+
+      amount: transaction.amount,
+
+      currency: transaction.currency,
+
+      status: transaction.status,
+
+      stripeSessionId: transaction.stripeSessionId,
+
+      stripePaymentIntent: transaction.stripePaymentIntent || null,
+
+      createdAt: transaction.createdAt,
+
+      paidAt: transaction.paidAt || null,
+    }));
+
+    return res.status(200).json({
+      success: true,
+      total: formattedTransactions.length,
+      data: formattedTransactions,
+    });
+  } catch (error) {
+    console.error("Admin Transactions Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch transactions",
+    });
+  }
+});
+
+// ====================================================
 
 /* =================================================
    END ADMIN ROUTES
@@ -1150,6 +1237,7 @@ app.get("/admin/overview", verifyAdmin, async (req, res) => {
 // STRIPE checkout
 // ?===============================================
 // Create Stripe Checkout Session
+
 app.post("/payments/create-checkout-session", async (req, res) => {
   try {
     // 1. Verify internal request
@@ -1166,14 +1254,15 @@ app.post("/payments/create-checkout-session", async (req, res) => {
       });
     }
 
-    if (!ObjectId.isValid(userId)) {
+    // 2. Validate user ID
+    if (!userId || !ObjectId.isValid(userId)) {
       return res.status(400).json({
         success: false,
         message: "Invalid user ID",
       });
     }
 
-    // 2. Find vendor
+    // 3. Find vendor
     const vendor = await usersCollection.findOne({
       _id: new ObjectId(userId),
     });
@@ -1185,14 +1274,15 @@ app.post("/payments/create-checkout-session", async (req, res) => {
       });
     }
 
-    if (vendor.banned === true) {
+    // 4. Check blocked status
+    if (vendor.isBlocked === true || vendor.banned === true) {
       return res.status(403).json({
         success: false,
         message: "Your account is blocked",
       });
     }
 
-    // 3. Check existing premium status
+    // 5. Check existing Premium
     if (
       vendor.subscriptionPlan === "premium" &&
       vendor.subscriptionStatus === "active"
@@ -1203,9 +1293,12 @@ app.post("/payments/create-checkout-session", async (req, res) => {
       });
     }
 
-    // 4. Count vendor services
+    // 6. Count vendor services
+    // Supports both string and ObjectId vendorId
     const totalServices = await servicesCollection.countDocuments({
-      vendorId: userId,
+      vendorId: {
+        $in: [userId, new ObjectId(userId)],
+      },
     });
 
     if (totalServices < 3) {
@@ -1215,18 +1308,40 @@ app.post("/payments/create-checkout-session", async (req, res) => {
       });
     }
 
-    // 5. Create Checkout Session
+    // 7. Validate CLIENT_URL
+    const clientUrl = process.env.CLIENT_URL?.trim().replace(/\/+$/, "");
+
+    if (!clientUrl) {
+      throw new Error("CLIENT_URL is missing in backend .env");
+    }
+
+    let parsedClientUrl;
+
+    try {
+      parsedClientUrl = new URL(clientUrl);
+    } catch {
+      throw new Error(
+        `Invalid CLIENT_URL: ${clientUrl}. Please include http:// or https://`,
+      );
+    }
+
+    if (
+      parsedClientUrl.protocol !== "http:" &&
+      parsedClientUrl.protocol !== "https:"
+    ) {
+      throw new Error("CLIENT_URL must use HTTP or HTTPS");
+    }
+
+    // 8. Create Stripe Checkout Session
     const checkoutSession = await stripe.checkout.sessions.create({
       mode: "payment",
-
-      payment_method_types: ["card"],
 
       customer_email: vendor.email,
 
       client_reference_id: userId,
 
       metadata: {
-        userId: userId,
+        userId: userId.toString(),
         plan: "premium",
       },
 
@@ -1247,12 +1362,20 @@ app.post("/payments/create-checkout-session", async (req, res) => {
         },
       ],
 
-      success_url: `${process.env.CLIENT_URL}/vendor/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      success_url: `${clientUrl}/vendor/payment/success?session_id={CHECKOUT_SESSION_ID}`,
 
-      cancel_url: `${process.env.CLIENT_URL}/vendor/upgrade`,
+      cancel_url: `${clientUrl}/vendor/upgrade`,
+    });
+    console.log("CHECKOUT SESSION CREATED:", {
+      sessionId: checkoutSession.id,
+      userId: checkoutSession.metadata?.userId,
+      plan: checkoutSession.metadata?.plan,
+      clientReferenceId: checkoutSession.client_reference_id,
+      amount: checkoutSession.amount_total,
+      currency: checkoutSession.currency,
     });
 
-    // 6. Save pending transaction
+    // 9. Save pending transaction
     await transactionsCollection.updateOne(
       {
         stripeSessionId: checkoutSession.id,
@@ -1260,6 +1383,7 @@ app.post("/payments/create-checkout-session", async (req, res) => {
       {
         $setOnInsert: {
           vendorId: userId,
+          vendorEmail: vendor.email,
           plan: "premium",
           amount: 199,
           currency: "usd",
@@ -1271,16 +1395,24 @@ app.post("/payments/create-checkout-session", async (req, res) => {
       { upsert: true },
     );
 
+    // 10. Send Stripe URL
     return res.status(200).json({
       success: true,
       url: checkoutSession.url,
+      sessionId: checkoutSession.id,
     });
   } catch (error) {
-    console.error("Stripe Checkout Error:", error);
+    console.error("========== STRIPE CHECKOUT ERROR ==========");
+    console.error("Error Message:", error.message);
+    console.error("Error Type:", error.type);
+    console.error("Error Code:", error.code);
+    console.error("Full Error:", error);
+    console.error("============================================");
 
     return res.status(500).json({
       success: false,
       message: "Could not create checkout session",
+      debug: error.message,
     });
   }
 });
@@ -1288,137 +1420,201 @@ app.post("/payments/create-checkout-session", async (req, res) => {
 // ?=====================================================
 // ?=====================================================
 
-app.post(
-  "/stripe/webhook",
+app.post("/stripe/verify-payment", verifyInternalRequest, async (req, res) => {
+  try {
+    const { sessionId } = req.body;
 
-  async (req, res) => {
-    const signature = req.headers["stripe-signature"];
+    const userId = req.headers["x-user-id"];
 
-    let event;
+    if (!sessionId || !userId || !ObjectId.isValid(userId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment information",
+      });
+    }
 
-    // 1. Verify Stripe signature
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.rawBody,
-        signature,
-        process.env.STRIPE_WEBHOOK_SECRET,
-      );
-    } catch (error) {
-      console.error("Webhook Signature Error:", error.message);
+    // STEP 1: Retrieve Checkout Session from Stripe
+    const checkoutSession = await stripe.checkout.sessions.retrieve(sessionId);
 
-      return res.status(400).send(`Webhook Error: ${error.message}`);
+    // STEP 2: Verify Payment
+    if (
+      checkoutSession.mode !== "payment" ||
+      checkoutSession.payment_status !== "paid" ||
+      checkoutSession.amount_total !== 19900 ||
+      checkoutSession.currency !== "usd" ||
+      checkoutSession.metadata?.plan !== "premium" ||
+      checkoutSession.metadata?.userId !== userId
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment verification failed",
+      });
+    }
+
+    // STEP 3: Find Transaction
+    const transaction = await transactionsCollection.findOne({
+      stripeSessionId: sessionId,
+      vendorId: userId,
+      plan: "premium",
+      amount: 199,
+      currency: "usd",
+    });
+
+    if (!transaction) {
+      return res.status(404).json({
+        success: false,
+        message: "Transaction not found",
+      });
+    }
+
+    // STEP 4: Already Paid Check
+    if (transaction.status === "paid") {
+      return res.status(200).json({
+        success: true,
+        message: "Premium already activated",
+      });
+    }
+
+    if (transaction.status !== "pending") {
+      return res.status(409).json({
+        success: false,
+        message: "Transaction is already being processed",
+      });
+    }
+
+    // STEP 5: Atomically Claim Transaction
+    const claimResult = await transactionsCollection.updateOne(
+      {
+        _id: transaction._id,
+        status: "pending",
+      },
+      {
+        $set: {
+          status: "processing",
+          processingAt: new Date(),
+        },
+      },
+    );
+
+    if (claimResult.modifiedCount !== 1) {
+      return res.status(409).json({
+        success: false,
+        message: "Transaction is already being processed",
+      });
     }
 
     try {
-      // 2. Successful checkout event
-      if (event.type === "checkout.session.completed") {
-        const checkoutSession = event.data.object;
-
-        const userId = checkoutSession.metadata?.userId;
-
-        // 3. Verify actual payment
-        if (
-          checkoutSession.mode !== "payment" ||
-          checkoutSession.payment_status !== "paid" ||
-          checkoutSession.amount_total !== 19900 ||
-          checkoutSession.currency !== "usd" ||
-          !userId ||
-          !ObjectId.isValid(userId)
-        ) {
-          return res.status(400).send("Invalid payment");
-        }
-        // 4. Verify transaction in MongoDB
-        // =================================================================================
-        const transaction = await transactionsCollection.findOne({
-          stripeSessionId: checkoutSession.id,
-          vendorId: userId,
-          plan: "premium",
-          amount: 199,
-          currency: "usd",
-        });
-
-        if (!transaction) {
-          return res.status(400).send("Transaction not found");
-        }
-
-        // 5. Prevent duplicate payment processing
-        if (transaction.status === "paid") {
-          return res.status(200).json({
-            received: true,
-            message: "Payment already processed",
-          });
-        }
-
-        if (transaction.status !== "pending") {
-          return res.status(400).send("Invalid transaction status");
-        }
-
-        // 4. Activate Premium
-        // 6. Activate Premium
-        const updateResult = await usersCollection.updateOne(
-          {
-            _id: new ObjectId(userId),
-            role: "vendor",
-            banned: { $ne: true },
+      // STEP 6: Activate Vendor Premium
+      const updateResult = await usersCollection.updateOne(
+        {
+          _id: new ObjectId(userId),
+          role: "vendor",
+        },
+        {
+          $set: {
+            subscriptionPlan: "premium",
+            subscriptionStatus: "active",
+            premiumActivatedAt: new Date(),
+            stripeCustomerId: checkoutSession.customer || null,
           },
-          {
-            $set: {
-              subscriptionPlan: "premium",
-              subscriptionStatus: "active",
-              premiumActivatedAt: new Date(),
-              stripeCustomerId: checkoutSession.customer || null,
-            },
+        },
+      );
+
+      if (updateResult.matchedCount !== 1) {
+        throw new Error("Vendor not found");
+      }
+
+      // STEP 7: Mark Transaction Paid
+      const transactionUpdate = await transactionsCollection.updateOne(
+        {
+          _id: transaction._id,
+          status: "processing",
+        },
+        {
+          $set: {
+            status: "paid",
+            stripePaymentIntent: checkoutSession.payment_intent || null,
+            paidAt: new Date(),
           },
-        );
-
-        if (updateResult.matchedCount !== 1) {
-          throw new Error("Vendor not found or account blocked");
-        }
-
-        // 5. Update transaction
-        // 7. Update transaction
-        const transactionUpdate = await transactionsCollection.updateOne(
-          {
-            stripeSessionId: checkoutSession.id,
-            vendorId: userId,
-            status: "pending",
+          $unset: {
+            processingAt: "",
           },
-          {
-            $set: {
-              status: "paid",
-              stripePaymentIntent: checkoutSession.payment_intent,
-              paidAt: new Date(),
-            },
-          },
-        );
+        },
+      );
 
-        if (transactionUpdate.modifiedCount !== 1) {
-          throw new Error("Transaction update failed");
-        }
-
-        console.log("Premium activated:", userId);
+      if (transactionUpdate.modifiedCount !== 1) {
+        throw new Error("Transaction update failed");
       }
 
       return res.status(200).json({
-        received: true,
+        success: true,
+        message: "Premium activated successfully",
       });
-    } catch (error) {
-      console.error("Webhook Processing Error:", error);
+    } catch (processingError) {
+      console.error("Premium Activation Error:", processingError);
 
-      return res.status(500).json({
-        received: false,
-      });
+      await transactionsCollection.updateOne(
+        {
+          _id: transaction._id,
+          status: "processing",
+        },
+        {
+          $set: {
+            status: "pending",
+          },
+          $unset: {
+            processingAt: "",
+          },
+        },
+      );
+
+      throw processingError;
     }
-  },
-);
+  } catch (error) {
+    console.error("Payment Verification Error:", error);
 
-// IMPORTANT: Keep this AFTER the webhook route.
-app.use(express.json());
+    return res.status(500).json({
+      success: false,
+      message: "Payment verification failed",
+    });
+  }
+});
+
 // ?=====================================================
 
 // =============================================
 // 9. HOME ROUTE
 // =============================================
+
+// ============================================
+// Home services card
+// ============================================
+
+app.get("/services/approved", async (req, res) => {
+  try {
+    const approvedServices = await servicesCollection
+      .find({
+        status: "approved",
+        approvalStatus: "approved",
+        isActive: true,
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      totalServices: approvedServices.length,
+      services: approvedServices,
+    });
+  } catch (error) {
+    console.error("Approved Services Error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch approved services",
+    });
+  }
+});
 
 // Backend Server সচল আছে কিনা পরীক্ষা
 app.get("/", (req, res) => {
