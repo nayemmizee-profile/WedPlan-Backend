@@ -4,6 +4,9 @@ import express from "express";
 import { MongoClient, ObjectId } from "mongodb";
 import multer from "multer";
 
+import Stripe from "stripe";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 // =============================================
 // 1. INITIAL SETUP
 // =============================================
@@ -171,24 +174,25 @@ const uploadToImgBB = async (file) => {
 // 8. ADD NEW SERVICE API
 // =============================================
 
+
 app.post(
   "/services",
 
-  // Step 1: Internal Request যাচাই
+  // =========================================
+  // STEP 1: VERIFY INTERNAL REQUEST
+  // =========================================
   verifyInternalRequest,
 
-  // Step 2: সর্বোচ্চ ৫টি Image গ্রহণ
+  // =========================================
+  // STEP 2: IMAGE UPLOAD (MAX 5)
+  // =========================================
   upload.array("images", 5),
 
   async (req, res) => {
     try {
-      // -----------------------------------------
-      // STEP 1: GET VENDOR EMAIL
-      // -----------------------------------------
-
-      // Next.js API Route থেকে Verified Session-এর
-      // Email গ্রহণ করা হচ্ছে
-      // STEP 1: GET VENDOR INFORMATION
+      // =========================================
+      // STEP 3: GET VENDOR INFORMATION
+      // =========================================
 
       const vendorEmail = req.headers["x-user-email"];
       const userId = req.headers["x-user-id"];
@@ -200,7 +204,10 @@ app.post(
         });
       }
 
-      // Find vendor
+      // =========================================
+      // STEP 4: FIND VENDOR
+      // =========================================
+
       const vendor = await usersCollection.findOne({
         email: vendorEmail,
       });
@@ -212,7 +219,10 @@ app.post(
         });
       }
 
-      // Verify MongoDB ID against Better Auth ID
+      // =========================================
+      // STEP 5: VERIFY VENDOR ID
+      // =========================================
+
       if (vendor._id.toString() !== userId) {
         return res.status(403).json({
           success: false,
@@ -220,34 +230,15 @@ app.post(
         });
       }
 
-      // Verify role
-      if (vendor.role !== "vendor") {
-        return res.status(403).json({
-          success: false,
-          message: "Only vendors can add services",
-        });
-      }
-
       const vendorId = vendor._id.toString();
 
-      console.log("Received User ID:", req.headers["x-user-id"]);
-      console.log("Received User Email:", req.headers["x-user-email"]);
+      console.log("Received Vendor ID:", vendorId);
+      console.log("Received Vendor Email:", vendorEmail);
 
-      const allVendors = await usersCollection
-        .find({
-          role: "vendor",
-        })
-        .toArray();
+      // =========================================
+      // STEP 6: VERIFY VENDOR ROLE
+      // =========================================
 
-      console.log("Available Vendors:", allVendors);
-
-      // MongoDB-এর প্রকৃত Vendor ID সংগ্রহ
-
-      // -----------------------------------------
-      // STEP 3: CHECK VENDOR ROLE
-      // -----------------------------------------
-
-      // শুধুমাত্র Vendor Service Add করতে পারবে
       if (vendor.role !== "vendor") {
         return res.status(403).json({
           success: false,
@@ -255,12 +246,10 @@ app.post(
         });
       }
 
-      // -----------------------------------------
-      // STEP 4: CHECK BLOCKED STATUS
-      // -----------------------------------------
+      // =========================================
+      // STEP 7: CHECK BLOCKED STATUS
+      // =========================================
 
-      // Admin Vendor-কে Block করলে
-      // Service Add করতে পারবে না
       if (vendor.isBlocked === true) {
         return res.status(403).json({
           success: false,
@@ -268,21 +257,24 @@ app.post(
         });
       }
 
-      // -----------------------------------------
-      // STEP 5: CHECK SUBSCRIPTION PLAN
-      // -----------------------------------------
+      // =========================================
+      // STEP 8: CHECK LIFETIME PREMIUM STATUS
+      // =========================================
 
-      // Vendor-এর Premium Subscription যাচাই
+      // One-time $199 payment করলে
+      // Vendor Lifetime Premium পাবে।
+
       const isPremium =
         vendor.subscriptionPlan === "premium" &&
-        vendor.subscriptionExpiresAt &&
-        new Date(vendor.subscriptionExpiresAt) > new Date();
+        vendor.subscriptionStatus === "active";
 
-      // -----------------------------------------
-      // STEP 6: FREE PLAN SERVICE LIMIT
-      // -----------------------------------------
+      // =========================================
+      // STEP 9: FREE PLAN SERVICE LIMIT
+      // =========================================
 
-      // Premium না হলে সর্বোচ্চ ৩টি Service Add করতে পারবে
+      // Free Vendor সর্বোচ্চ ৩টি Service Add করতে পারবে।
+      // Premium Vendor-এর কোনো Service Limit থাকবে না।
+
       if (!isPremium) {
         const totalServices = await servicesCollection.countDocuments({
           vendorId: vendorId,
@@ -291,35 +283,47 @@ app.post(
         if (totalServices >= 3) {
           return res.status(403).json({
             success: false,
+            code: "SERVICE_LIMIT_REACHED",
             upgradeRequired: true,
             message:
-              "Free plan allows only 3 services. Please upgrade to Premium.",
+              "You have reached your free service limit. Please pay $199 to unlock Lifetime Premium.",
+            totalServices,
+            freeLimit: 3,
+            upgradeUrl: "/vendor/upgrade",
           });
         }
       }
 
-      // -----------------------------------------
-      // STEP 7: GET FORM DATA
-      // -----------------------------------------
+      // =========================================
+      // STEP 10: GET FORM DATA
+      // =========================================
 
-      // Frontend FormData থেকে Service Information নেওয়া
-      const { serviceName, category, description, price, location } = req.body;
+      const {
+        serviceName,
+        category,
+        description,
+        price,
+        location,
+      } = req.body;
 
-      // -----------------------------------------
-      // STEP 8: VALIDATE FORM DATA
-      // -----------------------------------------
+      // =========================================
+      // STEP 11: VALIDATE FORM DATA
+      // =========================================
 
-      // Required Fields যাচাই
       if (
         typeof serviceName !== "string" ||
         !serviceName.trim() ||
+
         typeof category !== "string" ||
         !category.trim() ||
+
         typeof description !== "string" ||
         !description.trim() ||
+
         price === undefined ||
         price === null ||
         price === "" ||
+
         typeof location !== "string" ||
         !location.trim()
       ) {
@@ -329,20 +333,117 @@ app.post(
         });
       }
 
-      // -----------------------------------------
-      // STEP 9: VALIDATE PRICE
-      // -----------------------------------------
+      // =========================================
+      // STEP 12: VALIDATE PRICE
+      // =========================================
 
-      // Price Number-এ Convert
       const servicePrice = Number(price);
 
-      // Positive Number কিনা যাচাই
-      if (!Number.isFinite(servicePrice) || servicePrice <= 0) {
+      if (
+        !Number.isFinite(servicePrice) ||
+        servicePrice <= 0
+      ) {
         return res.status(400).json({
           success: false,
           message: "Please provide a valid price",
         });
       }
+
+      // =========================================
+      // STEP 13: GET UPLOADED IMAGES
+      // =========================================
+
+      const images = req.files || [];
+
+      if (images.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Please upload at least one image",
+        });
+      }
+
+      // =========================================
+      // STEP 14: PREPARE SERVICE DATA
+      // =========================================
+
+      // তোমার আগের Cloudinary/Image Upload Logic
+      // থাকলে এখানেই সেটি ব্যবহার করবে।
+
+      // নিচের উদাহরণটি ধরে নিচ্ছে যে upload
+      // middleware req.files-এ image URL রাখছে।
+      // Cloudinary ব্যবহার করলে secure_url mapping করবে।
+
+      const imageUrls = images.map((image) => {
+        return image.path || image.secure_url;
+      }).filter(Boolean);
+
+      if (imageUrls.length !== images.length) {
+        return res.status(400).json({
+          success: false,
+          message: "Image upload failed",
+        });
+      }
+
+      // =========================================
+      // STEP 15: CREATE SERVICE OBJECT
+      // =========================================
+
+      const newService = {
+        vendorId: vendorId,
+
+        vendorName: vendor.name,
+        vendorEmail: vendor.email,
+
+        serviceName: serviceName.trim(),
+        category: category.trim(),
+        description: description.trim(),
+
+        price: servicePrice,
+        location: location.trim(),
+
+        images: imageUrls,
+
+        approvalStatus: "pending",
+
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      // =========================================
+      // STEP 16: INSERT SERVICE
+      // =========================================
+
+      const result = await servicesCollection.insertOne(
+        newService
+      );
+
+      // =========================================
+      // STEP 17: SUCCESS RESPONSE
+      // =========================================
+
+      return res.status(201).json({
+        success: true,
+        message: "Service added successfully",
+
+        serviceId: result.insertedId,
+
+        isPremium,
+        totalImages: imageUrls.length,
+
+        service: newService,
+      });
+
+    } catch (error) {
+      console.error("Add Service Error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to add service",
+      });
+    }
+  }
+);
+
 
       // -----------------------------------------
       // STEP 10: VALIDATE IMAGES
@@ -1138,6 +1239,251 @@ app.get("/admin/overview", verifyAdmin, async (req, res) => {
 /* =================================================
    END ADMIN ROUTES
 ================================================= */
+
+
+// ?===============================================
+// STRIPE checkout 
+// ?===============================================
+// Create Stripe Checkout Session
+app.post("/payments/create-checkout-session", async (req, res) => {
+  try {
+    // 1. Verify internal request
+    const secret = req.headers["x-internal-secret"];
+    const userId = req.headers["x-user-id"];
+
+    if (
+      !process.env.INTERNAL_API_SECRET ||
+      secret !== process.env.INTERNAL_API_SECRET
+    ) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized request",
+      });
+    }
+
+    if (!ObjectId.isValid(userId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid user ID",
+      });
+    }
+
+    // 2. Find vendor
+    const vendor = await usersCollection.findOne({
+      _id: new ObjectId(userId),
+    });
+
+    if (!vendor || vendor.role !== "vendor") {
+      return res.status(403).json({
+        success: false,
+        message: "Vendor not found",
+      });
+    }
+
+    if (vendor.isBlocked) {
+      return res.status(403).json({
+        success: false,
+        message: "Your account is blocked",
+      });
+    }
+
+    // 3. Check existing premium status
+    if (vendor.subscriptionPlan === "premium") {
+      return res.status(400).json({
+        success: false,
+        message: "You already have Premium access",
+      });
+    }
+
+    // 4. Count vendor services
+    const totalServices = await servicesCollection.countDocuments({
+      vendorId: userId,
+    });
+
+    if (totalServices < 3) {
+      return res.status(403).json({
+        success: false,
+        message: "You can add 3 free services first",
+      });
+    }
+
+    // 5. Create Checkout Session
+    const checkoutSession = await stripe.checkout.sessions.create({
+      mode: "payment",
+
+      payment_method_types: ["card"],
+
+      customer_email: vendor.email,
+
+      client_reference_id: userId,
+
+      metadata: {
+        userId: userId,
+        plan: "premium",
+      },
+
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+
+            product_data: {
+              name: "Wedding Plan Premium Membership",
+              description:
+                "Unlimited additional service listings",
+            },
+
+            unit_amount: 19900,
+          },
+
+          quantity: 1,
+        },
+      ],
+
+      success_url:
+        `${process.env.CLIENT_URL}/vendor/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+
+      cancel_url:
+        `${process.env.CLIENT_URL}/vendor/upgrade`,
+    });
+
+    // 6. Save pending transaction
+    await transactionsCollection.updateOne(
+      {
+        stripeSessionId: checkoutSession.id,
+      },
+      {
+        $setOnInsert: {
+          vendorId: userId,
+          plan: "premium",
+          amount: 199,
+          currency: "usd",
+          stripeSessionId: checkoutSession.id,
+          status: "pending",
+          createdAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    return res.status(200).json({
+      success: true,
+      url: checkoutSession.url,
+    });
+
+  } catch (error) {
+    console.error("Stripe Checkout Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not create checkout session",
+    });
+  }
+});
+
+
+// ?=====================================================
+// ?=====================================================
+
+
+app.post(
+  "/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const signature = req.headers["stripe-signature"];
+
+    let event;
+
+    // 1. Verify Stripe signature
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (error) {
+      console.error("Webhook Signature Error:", error.message);
+
+      return res.status(400).send(
+        `Webhook Error: ${error.message}`
+      );
+    }
+
+    try {
+      // 2. Successful checkout event
+      if (event.type === "checkout.session.completed") {
+        const checkoutSession = event.data.object;
+
+        const userId = checkoutSession.metadata?.userId;
+
+        // 3. Verify actual payment
+        if (
+          checkoutSession.mode !== "payment" ||
+          checkoutSession.payment_status !== "paid" ||
+          checkoutSession.amount_total !== 19900 ||
+          checkoutSession.currency !== "usd" ||
+          !userId ||
+          !ObjectId.isValid(userId)
+        ) {
+          return res.status(400).send("Invalid payment");
+        }
+
+        // 4. Activate Premium
+        await usersCollection.updateOne(
+          {
+            _id: new ObjectId(userId),
+            role: "vendor",
+            isBlocked: { $ne: true },
+          },
+          {
+            $set: {
+              subscriptionPlan: "premium",
+              subscriptionStatus: "active",
+              premiumActivatedAt: new Date(),
+              stripeCustomerId:
+                checkoutSession.customer || null,
+            },
+          }
+        );
+
+        // 5. Update transaction
+        await transactionsCollection.updateOne(
+          {
+            stripeSessionId: checkoutSession.id,
+          },
+          {
+            $set: {
+              status: "paid",
+              stripePaymentIntent:
+                checkoutSession.payment_intent,
+              paidAt: new Date(),
+            },
+          },
+          { upsert: true }
+        );
+
+        console.log("Premium activated:", userId);
+      }
+
+      return res.status(200).json({
+        received: true,
+      });
+
+    } catch (error) {
+      console.error("Webhook Processing Error:", error);
+
+      return res.status(500).json({
+        received: false,
+      });
+    }
+  }
+);
+
+// IMPORTANT: Keep this AFTER the webhook route.
+app.use(express.json());
+// ?=====================================================
+
+
 
 // =============================================
 // 9. HOME ROUTE
