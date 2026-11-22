@@ -1582,9 +1582,279 @@ app.post("/stripe/verify-payment", verifyInternalRequest, async (req, res) => {
 
 // ?=====================================================
 
+// ===================================================
+//  usering booking
+// ===================================================
+
+app.post("/bookings", verifyInternalRequest, async (req, res) => {
+  try {
+    const userId = req.headers["x-user-id"];
+    const userEmail = req.headers["x-user-email"];
+    const userRole = req.headers["x-user-role"];
+
+    const { serviceId, eventDate } = req.body;
+
+    // Only normal users can book
+    if (userRole !== "user") {
+      return res.status(403).json({
+        success: false,
+        message: "Only users can book services",
+      });
+    }
+
+    if (!userId || !userEmail) {
+      return res.status(401).json({
+        success: false,
+        message: "User information is required",
+      });
+    }
+
+    if (!ObjectId.isValid(serviceId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service ID",
+      });
+    }
+
+    if (!eventDate || Number.isNaN(Date.parse(eventDate))) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid event date is required",
+      });
+    }
+
+    // Verify user from database
+    const user = await usersCollection.findOne({
+      email: userEmail,
+    });
+
+    if (!user || user.role !== "user") {
+      return res.status(403).json({
+        success: false,
+        message: "User account is not authorized",
+      });
+    }
+
+    // Find approved and active service
+    const service = await servicesCollection.findOne({
+      _id: new ObjectId(serviceId),
+      status: "approved",
+      approvalStatus: "approved",
+      isActive: true,
+    });
+
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found or unavailable",
+      });
+    }
+
+    // Prevent booking own service
+    if (service.vendorId === userId) {
+      return res.status(403).json({
+        success: false,
+        message: "You cannot book your own service",
+      });
+    }
+
+    const booking = {
+      serviceId: service._id.toString(),
+      serviceName: service.serviceName,
+      serviceImage: service.images?.[0] || "",
+      price: service.price,
+
+      vendorId: service.vendorId,
+      vendorName: service.vendorName,
+      vendorEmail: service.vendorEmail,
+
+      userId,
+      userName: user.name,
+      userEmail: user.email,
+
+      eventDate: new Date(eventDate),
+
+      status: "pending",
+
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await bookingsCollection.insertOne(booking);
+
+    res.status(201).json({
+      success: true,
+      message: "Booking request sent successfully",
+      bookingId: result.insertedId,
+    });
+  } catch (error) {
+    console.error("Create Booking Error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to send booking request",
+    });
+  }
+});
+
 // =============================================
-// 9. HOME ROUTE
+
+//  geting booking
 // =============================================
+
+app.get("/my-bookings", verifyInternalRequest, async (req, res) => {
+  try {
+    const userId = req.headers["x-user-id"];
+    const userRole = req.headers["x-user-role"];
+
+    if (userRole !== "user") {
+      return res.status(403).json({
+        success: false,
+        message: "Only users can access their bookings",
+      });
+    }
+
+    const bookings = await bookingsCollection
+      .find({ userId })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      totalBookings: bookings.length,
+      bookings,
+    });
+  } catch (error) {
+    console.error("My Bookings Error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch bookings",
+    });
+  }
+});
+
+// ==============================================
+// booking id
+// ==============================================
+app.patch("/bookings/:id/accept", verifyInternalRequest, async (req, res) => {
+  try {
+    const vendorId = req.headers["x-user-id"];
+    const vendorRole = req.headers["x-user-role"];
+
+    if (vendorRole !== "vendor") {
+      return res.status(403).json({
+        success: false,
+        message: "Only vendors can accept bookings",
+      });
+    }
+
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid booking ID",
+      });
+    }
+
+    const result = await bookingsCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+        vendorId,
+        status: "pending",
+      },
+      {
+        $set: {
+          status: "accepted",
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Pending booking not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Booking accepted successfully",
+    });
+  } catch (error) {
+    console.error("Accept Booking Error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to accept booking",
+    });
+  }
+});
+// ==============================================
+// booking rejecte
+// =============================================
+
+app.patch("/bookings/:id/reject", verifyInternalRequest, async (req, res) => {
+  try {
+    const vendorId = req.headers["x-user-id"];
+    const vendorRole = req.headers["x-user-role"];
+
+    if (vendorRole !== "vendor") {
+      return res.status(403).json({
+        success: false,
+        message: "Only vendors can reject bookings",
+      });
+    }
+
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid booking ID",
+      });
+    }
+
+    const result = await bookingsCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+        vendorId,
+        status: "pending",
+      },
+      {
+        $set: {
+          status: "rejected",
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Pending booking not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Booking rejected successfully",
+    });
+  } catch (error) {
+    console.error("Reject Booking Error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to reject booking",
+    });
+  }
+});
+
+// ===========================================
+// book service route
+// ==========================================
 
 // ============================================
 // Home services card
@@ -1592,13 +1862,24 @@ app.post("/stripe/verify-payment", verifyInternalRequest, async (req, res) => {
 
 app.get("/services/approved", async (req, res) => {
   try {
+    const { sort = "newest" } = req.query;
+
+    const sortOptions = {
+      newest: { createdAt: -1 },
+      lowToHigh: { price: 1 },
+      highToLow: { price: -1 },
+    };
+
+    const sortQuery = sortOptions[sort] || sortOptions.newest;
+
     const approvedServices = await servicesCollection
       .find({
         status: "approved",
         approvalStatus: "approved",
         isActive: true,
       })
-      .sort({ createdAt: -1 })
+      .sort(sortQuery)
+      .limit(10)
       .toArray();
 
     res.status(200).json({
@@ -1615,6 +1896,47 @@ app.get("/services/approved", async (req, res) => {
     });
   }
 });
+
+// Get Single Service by ID
+app.get("/services/:id", verifyInternalRequest, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service ID",
+      });
+    }
+
+    const service = await db
+      .collection("services")
+      .findOne({ _id: new ObjectId(id) });
+
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      service,
+    });
+  } catch (error) {
+    console.error("Service Details Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch service",
+    });
+  }
+});
+
+// =============================================
+// 9. HOME ROUTE
+// =============================================
 
 // Backend Server সচল আছে কিনা পরীক্ষা
 app.get("/", (req, res) => {
