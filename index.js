@@ -2069,6 +2069,49 @@ app.get("/services/approved", async (req, res) => {
   }
 });
 
+// ================================================
+// all services page
+// =============================================
+
+app.get("/services/all-approved", async (req, res) => {
+  try {
+    const { sort = "newest" } = req.query;
+
+    const sortOptions = {
+      newest: { createdAt: -1 },
+      lowToHigh: { price: 1 },
+      highToLow: { price: -1 },
+    };
+
+    const sortQuery = sortOptions[sort] || sortOptions.newest;
+
+    // Fetch ALL approved and active services
+    // No limit here
+
+    const approvedServices = await servicesCollection
+      .find({
+        status: "approved",
+        approvalStatus: "approved",
+        isActive: true,
+      })
+      .sort(sortQuery)
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      totalServices: approvedServices.length,
+      services: approvedServices,
+    });
+  } catch (error) {
+    console.error("All Approved Services Error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch all approved services",
+    });
+  }
+});
+
 // Get Single Service by ID
 app.get("/services/:id", verifyInternalRequest, async (req, res) => {
   try {
@@ -2252,3 +2295,5 @@ client
   .catch((error) => {
     console.error("MongoDB connection failed:", error);
   });
+
+export default app;
