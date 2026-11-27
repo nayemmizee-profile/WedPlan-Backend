@@ -41,41 +41,36 @@ app.use(cors());
 // =============================================
 
 // Environment Variable থেকে MongoDB Credentials নেওয়া
+
 const dbUser = process.env.DB_USER_ID;
 const dbPassword = process.env.DB_PASSWORD;
 
-// Credentials না থাকলে Error দেখাবে
 if (!dbUser || !dbPassword) {
   throw new Error("MongoDB credentials are missing!");
 }
 
-// MongoDB Connection URL তৈরি
 const mongoUri =
   `mongodb+srv://${encodeURIComponent(dbUser)}:${encodeURIComponent(dbPassword)}` +
   `@cluster0.stvgba2.mongodb.net/`;
 
-// MongoDB Client তৈরি
 const client = new MongoClient(mongoUri);
 
-// Database নির্বাচন
+// Connect MongoDB before starting the server
+await client.connect();
+
+console.log("MongoDB Connected Successfully!");
+
 const db = client.db("WEDDING_PLAN");
 
-// Database Export
 export { db };
 
-// =============================================
-// 4. DATABASE COLLECTIONS
-// =============================================
-
-// সকল Service এই Collection-এ থাকবে
+// Collections
 const servicesCollection = db.collection("services");
-
-// Better Auth-এর User Data এই Collection-এ থাকবে
 const usersCollection = db.collection("user");
-
 const transactionsCollection = db.collection("transactions");
-
 const bookingsCollection = db.collection("bookings");
+
+console.log("All MongoDB collections initialized successfully!");
 
 // =============================================
 // 5. MULTER IMAGE UPLOAD CONFIGURATION
@@ -242,7 +237,7 @@ app.post(
       // STEP 4: CHECK VENDOR ROLE
       // =========================================
 
-      if (vendor.role !== "vendor") {
+      if (vendor.accountType !== "vendor") {
         return res.status(403).json({
           success: false,
           message: "Only vendors can add services",
@@ -597,7 +592,7 @@ const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // GET: Fetch All Users with Search, Role & Pagination
 app.get("/admin/users", verifyAdmin, async (req, res) => {
   try {
-    const { search = "", role = "", page = 1, limit = 10 } = req.query;
+    const { search = "", accountType = "", page = 1, limit = 10 } = req.query;
 
     const currentPage = Math.max(1, Number(page) || 1);
     const pageLimit = Math.min(50, Math.max(1, Number(limit) || 10));
@@ -605,8 +600,8 @@ app.get("/admin/users", verifyAdmin, async (req, res) => {
     const filter = {};
 
     // Role Filter
-    if (role) {
-      filter.role = role;
+    if (accountType) {
+      filter.accountType = accountType;
     }
 
     // Search by Name or Email
@@ -1025,12 +1020,12 @@ app.get("/admin/overview", verifyAdmin, async (req, res) => {
 
     // Vendors
     const totalVendors = await usersCollection.countDocuments({
-      role: "vendor",
+      accountType: "vendor",
     });
 
     // Customers
     const totalCustomers = await usersCollection.countDocuments({
-      role: "user",
+      accountType: "user",
     });
 
     // Services
@@ -1267,7 +1262,7 @@ app.post("/payments/create-checkout-session", async (req, res) => {
       _id: new ObjectId(userId),
     });
 
-    if (!vendor || vendor.role !== "vendor") {
+    if (!vendor || vendor.accountType !== "vendor") {
       return res.status(403).json({
         success: false,
         message: "Vendor not found",
@@ -1508,7 +1503,7 @@ app.post("/stripe/verify-payment", verifyInternalRequest, async (req, res) => {
       const updateResult = await usersCollection.updateOne(
         {
           _id: new ObjectId(userId),
-          role: "vendor",
+          accountType: "vendor",
         },
         {
           $set: {
@@ -1586,56 +1581,76 @@ app.post("/stripe/verify-payment", verifyInternalRequest, async (req, res) => {
 //  usering booking
 // ===================================================
 
+// =========================================
+// CREATE BOOKING
+// =========================================
+
 app.post("/bookings", verifyInternalRequest, async (req, res) => {
   try {
-    const userId = req.headers["x-user-id"];
-    const userEmail = req.headers["x-user-email"];
-    const userRole = req.headers["x-user-role"];
-
     const { serviceId, eventDate } = req.body;
 
-    // Only normal users can book
-    if (userRole !== "user") {
-      return res.status(403).json({
-        success: false,
-        message: "Only users can book services",
-      });
-    }
+    const userId = req.headers["x-user-id"];
+    const userEmail = req.headers["x-user-email"];
 
-    if (!userId || !userEmail) {
-      return res.status(401).json({
-        success: false,
-        message: "User information is required",
-      });
-    }
-
-    if (!ObjectId.isValid(serviceId)) {
+    // 1. Validate required information
+    if (!serviceId || !eventDate || !userId || !userEmail) {
       return res.status(400).json({
         success: false,
-        message: "Invalid service ID",
+        message: "Missing required booking information.",
       });
     }
 
-    if (!eventDate || Number.isNaN(Date.parse(eventDate))) {
+    if (!ObjectId.isValid(serviceId) || !ObjectId.isValid(userId)) {
       return res.status(400).json({
         success: false,
-        message: "Valid event date is required",
+        message: "Invalid user or service ID.",
       });
     }
 
-    // Verify user from database
+    // 2. Validate event date
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(eventDate)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid event date.",
+      });
+    }
+
+    const parsedDate = new Date(`${eventDate}T00:00:00.000Z`);
+
+    if (
+      Number.isNaN(parsedDate.getTime()) ||
+      parsedDate.toISOString().slice(0, 10) !== eventDate
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid event date.",
+      });
+    }
+
+    // 3. Find customer
     const user = await usersCollection.findOne({
+      _id: new ObjectId(userId),
       email: userEmail,
     });
 
-    if (!user || user.role !== "user") {
-      return res.status(403).json({
+    if (!user) {
+      return res.status(404).json({
         success: false,
-        message: "User account is not authorized",
+        message: "User account not found.",
       });
     }
 
-    // Find approved and active service
+    // Support both Better Auth role fields
+    const accountRole = user.accountType || user.role;
+
+    if (accountRole !== "user") {
+      return res.status(403).json({
+        success: false,
+        message: "Only customers can book services.",
+      });
+    }
+
+    // 4. Find approved service
     const service = await servicesCollection.findOne({
       _id: new ObjectId(serviceId),
       status: "approved",
@@ -1646,33 +1661,51 @@ app.post("/bookings", verifyInternalRequest, async (req, res) => {
     if (!service) {
       return res.status(404).json({
         success: false,
-        message: "Service not found or unavailable",
+        message: "Service not found or unavailable.",
       });
     }
 
-    // Prevent booking own service
-    if (service.vendorId === userId) {
+    // 5. Prevent booking own service
+    if (service.vendorId?.toString() === userId.toString()) {
       return res.status(403).json({
         success: false,
-        message: "You cannot book your own service",
+        message: "You cannot book your own service.",
       });
     }
 
+    // 6. Prevent duplicate service booking
+    const existingBooking = await bookingsCollection.findOne({
+      userId: userId.toString(),
+      serviceId: service._id.toString(),
+    });
+
+    if (existingBooking) {
+      return res.status(409).json({
+        success: false,
+        errorType: "DUPLICATE_SERVICE",
+        message: "You have already booked this service.",
+      });
+    }
+
+    // 7. Create booking
     const booking = {
       serviceId: service._id.toString(),
-      serviceName: service.serviceName,
-      serviceImage: service.images?.[0] || "",
-      price: service.price,
 
-      vendorId: service.vendorId,
+      serviceName: service.serviceName,
+      serviceCategory: service.category,
+      servicePrice: service.price,
+      serviceImage: service.images?.[0] || "",
+
+      vendorId: service.vendorId?.toString(),
       vendorName: service.vendorName,
       vendorEmail: service.vendorEmail,
 
-      userId,
-      userName: user.name,
-      userEmail: user.email,
+      userId: userId.toString(),
+      userName: user.name || userEmail,
+      userEmail,
 
-      eventDate: new Date(eventDate),
+      eventDate: parsedDate,
+      eventDateKey: eventDate,
 
       status: "pending",
 
@@ -1682,17 +1715,31 @@ app.post("/bookings", verifyInternalRequest, async (req, res) => {
 
     const result = await bookingsCollection.insertOne(booking);
 
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
-      message: "Booking request sent successfully",
+      message: "Booking request submitted successfully!",
       bookingId: result.insertedId,
+      booking: {
+        ...booking,
+        _id: result.insertedId,
+      },
     });
   } catch (error) {
-    console.error("Create Booking Error:", error);
+    console.error("========== BOOKING ERROR ==========");
+    console.error(error);
+    console.error("===================================");
 
-    res.status(500).json({
+    if (error.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        errorType: "DUPLICATE_SERVICE",
+        message: "You have already booked this service.",
+      });
+    }
+
+    return res.status(500).json({
       success: false,
-      message: "Failed to send booking request",
+      message: "Unable to process booking. Please try again.",
     });
   }
 });
@@ -1709,19 +1756,24 @@ app.post("/bookings", verifyInternalRequest, async (req, res) => {
 app.get("/vendor/bookings", verifyInternalRequest, async (req, res) => {
   try {
     const vendorId = req.headers["x-user-id"];
-    const vendorRole = req.headers["x-user-role"];
+    const accountType = req.headers["x-user-account-type"];
 
-    if (!vendorId || vendorRole !== "vendor") {
+    console.log("========== VENDOR BOOKING DEBUG ==========");
+    console.log("Vendor ID:", vendorId);
+    console.log("Account Type:", accountType);
+    console.log("==========================================");
+
+    if (!vendorId || accountType !== "vendor") {
       return res.status(403).json({
         success: false,
         message: "Vendor access denied",
+        vendorId,
+        accountType,
       });
     }
 
-    // ১. URL থেকে status গ্রহণ
     const { status = "all" } = req.query;
 
-    // ২. Allowed status যাচাই
     const allowedStatuses = ["all", "pending", "accepted", "rejected"];
 
     if (!allowedStatuses.includes(status)) {
@@ -1731,21 +1783,17 @@ app.get("/vendor/bookings", verifyInternalRequest, async (req, res) => {
       });
     }
 
-    // ৩. Vendor অনুযায়ী query তৈরি
     const query = { vendorId };
 
-    // ৪. All ছাড়া অন্য filter হলে status যোগ
     if (status !== "all") {
       query.status = status;
     }
 
-    // ৫. Filter অনুযায়ী booking বের করা
     const bookings = await bookingsCollection
       .find(query)
       .sort({ createdAt: -1 })
       .toArray();
 
-    // ৬. সব status-এর count বের করা
     const [pending, accepted, rejected] = await Promise.all([
       bookingsCollection.countDocuments({
         vendorId,
@@ -1779,13 +1827,14 @@ app.get("/vendor/bookings", verifyInternalRequest, async (req, res) => {
     });
   }
 });
+
 // ==============================================
 // booking id
 // ==============================================
 app.patch("/bookings/:id/accept", verifyInternalRequest, async (req, res) => {
   try {
     const vendorId = req.headers["x-user-id"];
-    const vendorRole = req.headers["x-user-role"];
+    const vendorRole = req.headers["x-user-account-type"];
 
     if (vendorRole !== "vendor") {
       return res.status(403).json({
@@ -1844,7 +1893,7 @@ app.patch("/bookings/:id/accept", verifyInternalRequest, async (req, res) => {
 app.patch("/bookings/:id/reject", verifyInternalRequest, async (req, res) => {
   try {
     const vendorId = req.headers["x-user-id"];
-    const vendorRole = req.headers["x-user-role"];
+    const vendorRole = req.headers["x-user-account-type"];
 
     if (vendorRole !== "vendor") {
       return res.status(403).json({
@@ -1908,7 +1957,7 @@ app.patch("/bookings/:id/reject", verifyInternalRequest, async (req, res) => {
 app.get("/my-bookings", verifyInternalRequest, async (req, res) => {
   try {
     const userId = req.headers["x-user-id"];
-    const userRole = req.headers["x-user-role"];
+    const userRole = req.headers["x-user-account-type"];
 
     // Authentication check
     if (!userId || userRole !== "user") {
